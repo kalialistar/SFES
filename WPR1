@@ -1,0 +1,142 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import plotly.graph_objects as go
+import plotly.express as px
+import math
+
+# 온실 피복재 데이터 업데이트
+covering_materials = {
+    "유리": {
+        "광투과율": 82.5,  # twd (%)
+        "열관류율": 6.2,  # U (W/m²K)
+        "열전도율": 0.79,  # K (W/mK)
+        "두께": 2.5  # L (mm)
+    },
+    "PO": {
+        "광투과율": 89.6,
+        "열관류율": 5.1,
+        "열전도율": 0.125,
+        "두께": 0.1
+    },
+    "PE": {
+        "광투과율": 89.4,
+        "열관류율": 6.2,
+        "열전도율": 0.33,
+        "두께": 0.15
+    },
+    "ETFE": {
+        "광투과율": 92.5,
+        "열관류율": 6.6,
+        "열전도율": 0.25,
+        "두께": 0.08
+    }
+}
+
+
+def calculate_areas(width, length, eave_height, ridge_height):
+    """온실의 각 부분 면적 계산
+    Returns:
+        Arf: 지붕면 면적
+        Asw: 측벽 면적
+        Afl: 바닥 면적
+        Asf: 전체 표면적
+    """
+    Arf = math.sqrt((width / 2) ** 2 + (ridge_height - eave_height) ** 2) * length
+    Asw = ((width * (ridge_height - eave_height)) + (2 * width * eave_height)) + (2 * length * eave_height)
+    Afl = width * length
+    Asf = Arf + Asw
+    return Arf, Asw, Afl, Asf
+
+
+def calculate_heat_transfer(material_type):
+    """선택된 피복재의 열전달 관련 값들을 반환
+    Returns:
+        dict: K (열전도율), U (열관류율), twd (광투과율), L (두께)
+    """
+    material = covering_materials[material_type]
+    return {
+        'K': material['열전도율'],
+        'U': material['열관류율'],
+        'twd': material['광투과율'] / 100,  # % to decimal
+        'L': material['두께']
+    }
+
+
+def calculate_detailed_heating_load(width, length, eave_height, ridge_height,
+                                    Troom, Toutdoor, Tgr, Isol,
+                                    material_type):
+    """온실 난방부하 상세 계산 (계산식은 추후 업데이트 예정)
+    Parameters:
+        width: 온실 폭
+        length: 온실 길이
+        eave_height: 처마 높이
+        ridge_height: 동고
+        Troom: 실내온도
+        Toutdoor: 외기온도
+        Tgr: 지중온도
+        Isol: 일사량
+        material_type: 피복재 종류
+    """
+    # 면적 계산
+    Arf, Asw, Afl, Asf = calculate_areas(width, length, eave_height, ridge_height)
+
+    # 피복재 물성치
+    properties = calculate_heat_transfer(material_type)
+    K = properties['K']
+    U = properties['U']
+    twd = properties['twd']
+    L = properties['L']
+
+    # 상수 정의
+    ACH = 1.0  # 시간당 공기 순환량
+    agh = 0.15  # 태양에너지흡수계수
+
+    # 여기에 계산식이 들어갈 예정
+    # Qrf, Qsw, Qfl, Qvt, Qrad, Qt 계산
+
+    return 0  # 임시 반환값
+
+
+# Streamlit UI
+st.markdown("<h3 style='text-align: center; color: black;'>강릉 스마트팜 온실 난방부하 계산기</h3>", unsafe_allow_html=True)
+
+# 온실 구조 입력
+st.markdown("<h4 style='text-align: left; color: black;'>온실 구조 입력</h4>", unsafe_allow_html=True)
+
+# 온실 종류 선택
+greenhouse_type = st.selectbox("온실 종류", ["유리온실", "플라스틱 온실"])
+
+if greenhouse_type == "유리온실":
+    material_type = "유리"
+    material = covering_materials['유리']
+    st.info(f"""유리온실 특성:
+    - 광투과율: {material['광투과율']}%
+    - 열관류율: {material['열관류율']} W/m²K
+    - 열전도율: {material['열전도율']} W/mK
+    - 두께: {material['두께']} mm""")
+else:
+    material_type = st.selectbox(
+        "피복재 선택",
+        ["PO", "PE", "ETFE"],
+        format_func=lambda x: f"""{x} (광투과율: {covering_materials[x]['광투과율']}%, 
+        열관류율: {covering_materials[x]['열관류율']} W/m²K, 
+        열전도율: {covering_materials[x]['열전도율']} W/mK, 
+        두께: {covering_materials[x]['두께']} mm)"""
+    )
+
+col1, col2 = st.columns(2)
+
+with col1:
+    width = st.number_input("온실의 폭 (m)", min_value=1.0, step=0.1)
+    length = st.number_input("온실의 길이 (m)", min_value=1.0, step=0.1)
+
+with col2:
+    ridge_height = st.number_input("온실 동고 (m)", min_value=1.0, step=0.1)
+    eave_height = st.number_input("온실 측고 (m)", min_value=1.0, step=0.1)
+    indoor_temp = st.number_input("실내 설정온도 (°C)", min_value=-20.0, max_value=50.0, value=20.0, step=0.1)
+
+# 계산 버튼 (결과 표시 부분은 계산식 구현 후 업데이트 예정)
+if st.button("난방부하 계산"):
+    st.info("계산식 구현 예정")
