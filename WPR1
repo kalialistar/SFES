@@ -6,6 +6,35 @@ import plotly.graph_objects as go
 import plotly.express as px
 import math
 
+def load_gangneung_data():
+    """
+    강릉 기상데이터 로드 및 전처리 함수
+    Returns:
+        DataFrame: 전처리된 기상 데이터
+    """
+    # CSV 파일 로드
+    df = pd.read_csv('gangneung_2024.csv')
+    
+    # 컬럼명 매핑 (CSV 파일의 실제 컬럼명에 따라 수정 필요)
+    column_mapping = {
+        'temperature': '기온',
+        'wind_speed': '풍속',
+        'humidity': '습도',
+        'solar_radiation': '일사',
+        'ground_temperature': '지온'
+    }
+    
+    # 시간 정보 생성
+    start_date = datetime(2024, 1, 1)
+    dates = [start_date + timedelta(hours=i) for i in range(8760)]
+    
+    # DataFrame에 시간 정보 추가
+    df['datetime'] = dates
+    df['day_of_year'] = df['datetime'].dt.dayofyear
+    df['hour'] = df['datetime'].dt.hour
+    
+    return df
+
 # 온실 피복재 데이터 업데이트
 covering_materials = {
     "유리": {
