@@ -1,171 +1,243 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime
 import plotly.graph_objects as go
-import plotly.express as px
-import math
+from CoolProp.CoolProp import PropsSI
 
-def load_gangneung_data():
+
+def process_jeonju_data():
     """
-    강릉 기상데이터 로드 및 전처리 함수
-    Returns:
-        DataFrame: 전처리된 기상 데이터
+    Process Jeonju weather data and calculate qt values for leap year (8784 hours)
     """
-    # CSV 파일 로드
-    df = pd.read_csv('gangneung_2024.csv')
-    
-    # 컬럼명 매핑 (CSV 파일의 실제 컬럼명에 따라 수정 필요)
-    column_mapping = {
-        'temperature': '기온',
-        'wind_speed': '풍속',
-        'humidity': '습도',
-        'solar_radiation': '일사',
-        'ground_temperature': '지온'
-    }
-    
-    # 시간 정보 생성
-    start_date = datetime(2024, 1, 1)
-    dates = [start_date + timedelta(hours=i) for i in range(8760)]
-    
-    # DataFrame에 시간 정보 추가
-    df['datetime'] = dates
-    df['day_of_year'] = df['datetime'].dt.dayofyear
-    df['hour'] = df['datetime'].dt.hour
-    
-    return df
+    # Read the Excel file
+    df = pd.read_excel("Jeonju_data.xlsx")
 
-# 온실 피복재 데이터 업데이트
-covering_materials = {
-    "유리": {
-        "광투과율": 82.5,  # twd (%)
-        "열관류율": 6.2,  # U (W/m²K)
-        "열전도율": 0.79,  # K (W/mK)
-        "두께": 2.5  # L (mm)
-    },
-    "PO": {
-        "광투과율": 89.6,
-        "열관류율": 5.1,
-        "열전도율": 0.125,
-        "두께": 0.1
-    },
-    "PE": {
-        "광투과율": 89.4,
-        "열관류율": 6.2,
-        "열전도율": 0.33,
-        "두께": 0.15
-    },
-    "ETFE": {
-        "광투과율": 92.5,
-        "열관류율": 6.6,
-        "열전도율": 0.25,
-        "두께": 0.08
-    }
-}
+    # Generate timestamp for each hour of the leap year
+    start_date = pd.Timestamp('2024-01-01')  # 2024년은 윤년입니다
+    df['timestamp'] = [start_date + pd.Timedelta(hours=i) for i in range(8784)]
+    df['hour'] = range(1, 8785)
 
+    # 기온(섭씨)을 켈빈으로 변환: Toutdoor
+    Toutdoor = df['기온'].values + 273  # 섭씨에 273을 더해 켈빈으로 변환
 
-def calculate_areas(width, length, eave_height, ridge_height):
-    """온실의 각 부분 면적 계산
-    Returns:
-        Arf: 지붕면 면적
-        Asw: 측벽 면적
-        Afl: 바닥 면적
-        Asf: 전체 표면적
-    """
-    Arf = math.sqrt((width / 2) ** 2 + (ridge_height - eave_height) ** 2) * length
-    Asw = ((width * (ridge_height - eave_height)) + (2 * width * eave_height)) + (2 * length * eave_height)
-    Afl = width * length
-    Asf = Arf + Asw
-    return Arf, Asw, Afl, Asf
+    # 일사량을 W/m2로 변환하고 결측값을 0으로 채움: radSolar
+    df['일사'] = df['일사'].fillna(0)  # 결측값을 0으로 채움
+    radSolar = df['일사'].values * 277.778  # MJ/m2/hr에서 W/m2로 정확한 변환
 
+    # 지중온도 설정
+    Tground = 283  # 10℃ + 273 = 283K
 
-def calculate_heat_transfer(material_type):
-    """선택된 피복재의 열전달 관련 값들을 반환
-    Returns:
-        dict: K (열전도율), U (열관류율), twd (광투과율), L (두께)
-    """
-    material = covering_materials[material_type]
-    return {
-        'K': material['열전도율'],
-        'U': material['열관류율'],
-        'twd': material['광투과율'] / 100,  # % to decimal
-        'L': material['두께']
+    # Basic constants
+    P_atm = 101325
+    T_mean = 300
+    rhoAir = PropsSI("D", "T", T_mean, "P", P_atm, "air")
+    cAir = PropsSI("C", "T", T_mean, "P", P_atm, "air") / 1000
+
+    # Building dimensions
+    lengthHouse = 40.05
+    widthHouse = 16
+    heightHouse = 4
+    fracSolarWindow = 0.55
+    transGlass = 0.896
+
+    # Calculate areas
+    areaHouse = lengthHouse * widthHouse
+    surfaceHouse = (widthHouse * heightHouse + lengthHouse * heightHouse) * 2
+    volumeHouse = areaHouse * heightHouse
+    mHouse = volumeHouse * rhoAir
+
+    # Other parameters
+    ACH = 1
+    agh = 0.15
+    Yt = 5.2  # Heat transfer coefficient of PO film
+
+    # Process data and calculate qt
+    Troom = np.ones(8784) * (15 + 273)  # Initialize at 288K (15°C) for 8784 hours
+    qt = np.zeros(8784)
+
+    for i in range(8784):
+        # Calculate Tsolair2
+        Tsolair2 = Toutdoor[i] + (agh * radSolar[i]) / 17
+
+        # Calculate components
+        qRad = (fracSolarWindow * transGlass * areaHouse * radSolar[i]) / 1000
+        qRoof = (Tsolair2 - Troom[i]) * Yt * areaHouse / 1000
+        qFloor = (Tground - Troom[i]) * Yt * areaHouse / 1000
+        qSideWall = (Tsolair2 - Troom[i]) * Yt * surfaceHouse / 1000
+        qvent = ACH * (Toutdoor[i] - Troom[i]) * mHouse * cAir / 3600 / 1000
+
+        # Calculate total qt
+        qt[i] = qRad + qRoof + qFloor + qSideWall + qvent
+
+    return df, qt, Toutdoor, radSolar, Troom, {
+        'rhoAir': rhoAir, 'cAir': cAir, 'areaHouse': areaHouse,
+        'surfaceHouse': surfaceHouse, 'mHouse': mHouse,
+        'fracSolarWindow': fracSolarWindow, 'transGlass': transGlass,
+        'Tground': Tground, 'ACH': ACH, 'agh': agh, 'Yt': Yt
     }
 
-
-def calculate_detailed_heating_load(width, length, eave_height, ridge_height,
-                                    Troom, Toutdoor, Tgr, Isol,
-                                    material_type):
-    """온실 난방부하 상세 계산 (계산식은 추후 업데이트 예정)
-    Parameters:
-        width: 온실 폭
-        length: 온실 길이
-        eave_height: 처마 높이
-        ridge_height: 동고
-        Troom: 실내온도
-        Toutdoor: 외기온도
-        Tgr: 지중온도
-        Isol: 일사량
-        material_type: 피복재 종류
+def show_detailed_calculation(hour_index, df, params, Toutdoor, radSolar, Troom):
     """
-    # 면적 계산
-    Arf, Asw, Afl, Asf = calculate_areas(width, length, eave_height, ridge_height)
+    특정 시간의 qt 계산 과정을 상세히 보여주는 함수
+    """
+    # Get timestamp for the selected hour
+    timestamp = df['timestamp'].iloc[hour_index]
+    date_str = timestamp.strftime("%Y년 %m월 %d일 %H시")
 
-    # 피복재 물성치
-    properties = calculate_heat_transfer(material_type)
-    K = properties['K']
-    U = properties['U']
-    twd = properties['twd']
-    L = properties['L']
+    # 해당 시간의 기본 데이터
+    outdoor_temp = Toutdoor[hour_index]
+    solar_rad = radSolar[hour_index]
+    room_temp = Troom[hour_index]
 
-    # 상수 정의
-    ACH = 1.0  # 시간당 공기 순환량
-    agh = 0.15  # 태양에너지흡수계수
+    # Tsolair2 계산
+    tsolair2 = outdoor_temp + (params['agh'] * solar_rad) / 17
 
-    # 여기에 계산식이 들어갈 예정
-    # Qrf, Qsw, Qfl, Qvt, Qrad, Qt 계산
+    # 각 컴포넌트 계산
+    q_rad = (params['fracSolarWindow'] * params['transGlass'] * params['areaHouse'] * solar_rad) / 1000
+    q_roof = (tsolair2 - room_temp) * params['Yt'] * params['areaHouse'] / 1000
+    q_floor = (params['Tground'] - room_temp) * params['Yt'] * params['areaHouse'] / 1000
+    q_sidewall = (tsolair2 - room_temp) * params['Yt'] * params['surfaceHouse'] / 1000
+    q_vent = params['ACH'] * (outdoor_temp - room_temp) * params['mHouse'] * params['cAir'] / 3600 / 1000
 
-    return 0  # 임시 반환값
+    # 총 qt 계산
+    qt_total = q_rad + q_roof + q_floor + q_sidewall + q_vent
+
+    calculations = {
+        "날짜 및 시간": date_str,
+        "기본 데이터": {
+            "외기온도": f"{outdoor_temp:.2f} K ({outdoor_temp - 273.15:.2f}°C)",
+            "일사량": f"{solar_rad:.2f} W/m² (원본: {df['일사'].iloc[hour_index]:.2f} MJ/m²/hr)",
+            "실내온도": f"{room_temp:.2f} K ({room_temp - 273.15:.2f}°C)",
+            "지중온도": f"{params['Tground']:.2f} K ({params['Tground'] - 273.15:.2f}°C)"
+        },
+        "Tsolair2 계산": {
+            "공식": "Tsolair2 = Toutdoor + (agh * radSolar) / 17",
+            "계산": f"{outdoor_temp:.2f} + ({params['agh']:.2f} * {solar_rad:.2f}) / 17",
+            "결과": f"{tsolair2:.2f} K"
+        },
+        "에너지 부하 계산": {
+            "태양 복사 에너지 부하 (qRad)": {
+                "공식": "qRad = (fracSolarWindow * transGlass * areaHouse * radSolar) / 1000",
+                "계산": f"({params['fracSolarWindow']:.3f} * {params['transGlass']:.3f} * {params['areaHouse']:.2f} * {solar_rad:.2f}) / 1000",
+                "결과": f"{q_rad:.2f} kW"
+            },
+            "지붕 관류열 부하 (qRoof)": {
+                "공식": "qRoof = (Tsolair2 - Troom) * Yt * areaHouse / 1000",
+                "계산": f"({tsolair2:.2f} - {room_temp:.2f}) * {params['Yt']:.2f} * {params['areaHouse']:.2f} / 1000",
+                "결과": f"{q_roof:.2f} kW"
+            },
+            "지중 전열 부하 (qFloor)": {
+                "공식": "qFloor = (Tground - Troom) * Yt * areaHouse / 1000",
+                "계산": f"({params['Tground']:.2f} - {room_temp:.2f}) * {params['Yt']:.2f} * {params['areaHouse']:.2f} / 1000",
+                "결과": f"{q_floor:.2f} kW"
+            },
+            "측벽 관류열 부하 (qSideWall)": {
+                "공식": "qSideWall = (Tsolair2 - Troom) * Yt * surfaceHouse / 1000",
+                "계산": f"({tsolair2:.2f} - {room_temp:.2f}) * {params['Yt']:.2f} * {params['surfaceHouse']:.2f} / 1000",
+                "결과": f"{q_sidewall:.2f} kW"
+            },
+            "틈새 환기 전열 부하 (qVent)": {
+                "공식": "qVent = ACH * (Toutdoor - Troom) * mHouse * cAir / 3600 / 1000",
+                "계산": f"{params['ACH']:.2f} * ({outdoor_temp:.2f} - {room_temp:.2f}) * {params['mHouse']:.2f} * {params['cAir']:.4f} / 3600 / 1000",
+                "결과": f"{q_vent:.2f} kW"
+            }
+        },
+        "총 에너지 부하 (qt)": {
+            "공식": "qt = qRad + qRoof + qFloor + qSideWall + qVent",
+            "계산": f"{q_rad:.2f} + {q_roof:.2f} + {q_floor:.2f} + {q_sidewall:.2f} + {q_vent:.2f}",
+            "결과": f"{qt_total:.2f} kW"
+        }
+    }
+
+    return calculations
+
+def main():
+    st.markdown("<h2 style='text-align: center; color: black;'>2024년 전북대 온실 에너지 부하</h2>", unsafe_allow_html=True)
+
+    try:
+        df, qt, Toutdoor, radSolar, Troom, params = process_jeonju_data()
+
+        # 시간 입력
+        selected_hour = st.number_input('시간을 입력하세요 (1-8784)', min_value=1, max_value=8784, value=1)
+
+        # 선택된 시간의 상세 계산 표시
+        calculations = show_detailed_calculation(selected_hour - 1, df, params, Toutdoor, radSolar, Troom)
+
+        # 계산 과정 표시
+        st.header(f"{calculations['날짜 및 시간']}의 상세 계산 과정")
+
+        # 기본 데이터 표시
+        st.subheader('1. 기본 데이터')
+        for key, value in calculations['기본 데이터'].items():
+            st.write(f"- {key}: {value}")
+
+        # Tsolair2 계산 표시
+        st.subheader('2. Tsolair2 계산')
+        st.write(f"공식: {calculations['Tsolair2 계산']['공식']}")
+        st.write(f"계산: {calculations['Tsolair2 계산']['계산']}")
+        st.write(f"결과: {calculations['Tsolair2 계산']['결과']}")
+
+        # 열부하 계산 표시
+        st.subheader('3. 각 부분별 에너지 부하 계산')
+        for component, details in calculations['에너지 부하 계산'].items():
+            st.write(f"\n**{component}**")
+            st.write(f"공식: {details['공식']}")
+            st.write(f"계산: {details['계산']}")
+            st.write(f"결과: {details['결과']}")
+
+        # 총 열부하 표시
+        st.subheader('4. 총 에너지 부하 (qt)')
+        st.write(f"공식: {calculations['총 에너지 부하 (qt)']['공식']}")
+        st.write(f"계산: {calculations['총 에너지 부하 (qt)']['계산']}")
+        st.write(f"결과: {calculations['총 에너지 부하 (qt)']['결과']}")
+
+        # 연간 열부하 그래프 표시
+        st.header('연간 에너지 부하 그래프')
+
+        # Create figure
+        fig = go.Figure()
+
+        # 에너지 손실 (음수 값)
+        losses = [q if q < 0 else 0 for q in qt]
+        fig.add_trace(go.Scatter(
+            x=list(range(1, 8785)),
+            y=losses,
+            mode='lines',
+            name='에너지 손실',
+            line=dict(color='red'),
+            fill='tozeroy'
+        ))
+
+        # 에너지 유입 (양수 값)
+        gains = [q if q > 0 else 0 for q in qt]
+        fig.add_trace(go.Scatter(
+            x=list(range(1, 8785)),
+            y=gains,
+            mode='lines',
+            name='에너지 유입',
+            line=dict(color='blue'),
+            fill='tozeroy'
+        ))
+
+        # Update layout
+        fig.update_layout(
+            title='Annual Energy Load (qt)',
+            xaxis_title='Hour of Year (h)',
+            yaxis_title='Energy Load (kW)',
+            showlegend=True,
+            hovermode='x unified'
+        )
+
+        # Add a horizontal line at y=0
+        fig.add_hline(y=0, line_dash="dash", line_color="black", line_width=1)
+
+        st.plotly_chart(fig)
+
+    except FileNotFoundError:
+        st.error("'Jeonju_data.xlsx' 파일을 찾을 수 없습니다. 파일이 올바른 위치에 있는지 확인해주세요.")
+    except Exception as e:
+        st.error(f"오류가 발생했습니다: {str(e)}")
 
 
-# Streamlit UI
-st.markdown("<h3 style='text-align: center; color: black;'>강릉 스마트팜 온실 난방부하 계산기</h3>", unsafe_allow_html=True)
-
-# 온실 구조 입력
-st.markdown("<h4 style='text-align: left; color: black;'>온실 구조 입력</h4>", unsafe_allow_html=True)
-
-# 온실 종류 선택
-greenhouse_type = st.selectbox("온실 종류", ["유리온실", "플라스틱 온실"])
-
-if greenhouse_type == "유리온실":
-    material_type = "유리"
-    material = covering_materials['유리']
-    st.info(f"""유리온실 특성:
-    - 광투과율: {material['광투과율']}%
-    - 열관류율: {material['열관류율']} W/m²K
-    - 열전도율: {material['열전도율']} W/mK
-    - 두께: {material['두께']} mm""")
-else:
-    material_type = st.selectbox(
-        "피복재 선택",
-        ["PO", "PE", "ETFE"],
-        format_func=lambda x: f"""{x} (광투과율: {covering_materials[x]['광투과율']}%, 
-        열관류율: {covering_materials[x]['열관류율']} W/m²K, 
-        열전도율: {covering_materials[x]['열전도율']} W/mK, 
-        두께: {covering_materials[x]['두께']} mm)"""
-    )
-
-col1, col2 = st.columns(2)
-
-with col1:
-    width = st.number_input("온실의 폭 (m)", min_value=1.0, step=0.1)
-    length = st.number_input("온실의 길이 (m)", min_value=1.0, step=0.1)
-
-with col2:
-    ridge_height = st.number_input("온실 동고 (m)", min_value=1.0, step=0.1)
-    eave_height = st.number_input("온실 측고 (m)", min_value=1.0, step=0.1)
-    indoor_temp = st.number_input("실내 설정온도 (°C)", min_value=-20.0, max_value=50.0, value=20.0, step=0.1)
-
-# 계산 버튼 (결과 표시 부분은 계산식 구현 후 업데이트 예정)
-if st.button("난방부하 계산"):
-    st.info("계산식 구현 예정")
+if __name__ == '__main__':
+    main()
