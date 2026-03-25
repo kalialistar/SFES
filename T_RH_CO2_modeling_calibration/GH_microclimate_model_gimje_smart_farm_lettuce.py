@@ -1,0 +1,1652 @@
+import argparse
+import math
+from pathlib import Path
+from typing import Tuple
+
+import numpy as np
+import pandas as pd
+
+try:
+    from CoolProp.CoolProp import PropsSI, HAPropsSI
+    coolprop_use = True
+except Exception:
+    coolprop_use = False
+
+Patm = 101325.0
+Sigma = 5.670374419e-8
+R_air = 287.058          # J/kg/K (dry air)
+R_univ = 8.314462618     # J/mol/K
+ga = 9.81                # m/s^2
+m_CO2 = 44.01e-3         # kg/mol (CO2 molecular weight)
+
+lengthHouse = 80.0
+widthHouse  = 48.0
+heightHouse = 6.0
+areaHouse   = lengthHouse * widthHouse
+surfaceHouse = (widthHouse * heightHouse + lengthHouse * heightHouse) * 2.0
+volumeHouse = areaHouse * heightHouse
+cropArea    = areaHouse
+
+Chouse  = 850000.0  # Factor of Temp -> Heat Capacity
+CWhouse = 350000.0   # Factor of Humid -> water Capacity
+
+agh = 0.15
+Tgroundi = 30.0 + 273.15
+cloud_default = 0.5
+deltaT_leaf_air = 0.0   # 상추 기준 일반적으로 크게 다르지 않음(환경에 대한 차이가 큼)
+
+LAYER_PROPS = {
+    "PO필름": {"tau_ir": 0.35, "eps_lw": 0.50, "alpha_sw": 0.15, "k": 0.25, "t": 0.00015},
+    "AL스크린": {"tau_ir": 0.10, "eps_lw": 0.10, "alpha_sw": 0.05, "k": 1.0, "t": 0.0005},
+    "보온커튼": {"tau_ir": 0.05, "eps_lw": 0.90, "alpha_sw": 0.15,  "k": 0.06, "t": 0.003},
+}
+
+a_sw_can = 0.53
+k_sw = 0.70
+
+LAI_init = 1.0
+LAI_max = 3.0
+
+Ld_init = 0.10   # m
+Ld_max = 0.20    # m
+
+Lw_init = 0.06   # m
+Lw_max = 0.12    # m
+
+growth_days = 30.0
+
+PAR_frac = 0.45
+unit_PAR = 4.57
+eps_lw_leaf = 0.97
+
+# Photosynthesis / respiration (FvCB based parameter)
+THETA_A = 0.99
+PHI_J = 0.257
+THETA_J = 0.936
+O2_MIX = 210.0          # mmol mol-1
+
+VCMAX25 = 82.5        # umol m-2 s-1
+EA_VCMAX = 58.55e3      # J mol-1
+DS_VCMAX = 0.62926e3      # J mol-1 K-1
+HD_VCMAX = 200.0e3      # J mol-1
+
+JMAX25 = 157.2         # umol m-2 s-1
+EA_JMAX = 29.68e3       # J mol-1
+DS_JMAX = 0.63188e3       # J mol-1 K-1
+HD_JMAX = 200.0e3       # J mol-1
+
+KC25 = 404.9           # umol mol-1
+EA_KC = 79.43e3         # J mol-1
+KO25 = 278.4           # mmol mol-1
+EA_KO = 36.38e3         # J mol-1
+GAMMA25 = 42.75         # umol mol-1
+EA_GAMMA = 37.83e3      # J mol-1
+
+RN25 = 1.251             # umol m-2 s-1
+EA_RN = 53.5e3         # J mol-1
+
+
+Cout_ppm = 425.0
+Cin_int_ppm = 420.0
+Cin_min_ppm = 200.0
+Cin_max_ppm = 2000.0
+VCeff_night = 0.8  # Factor of CO2 -> effective air-mixing volume coefficient(cultivation Area Difference)
+
+# U-value of floor in greenhouse
+Ug = 1.0
+
+RSMIN_LEAF = 100.0  # s m-1, Jarvis/Stanghellini minimum leaf stomatal resistance
+
+# Nutrient-solution free-surface evaporation parameters
+solution_surface_temp_C = 20.0
+solution_surface_exposure_fraction = 0.30
+solution_surface_length = 1.0  # L in h = Nu*k/L (user set)
+
+# Cover condensation / literature-based inner convection
+cond_factor = 6.4e-9  # kg m-2 s-1 per (W m-2 K-1 Pa-1), De Zwart-type condensation conversion
+gap_F_S = 1.00   # film-screen gap thickness [m]
+gap_S_C = 0.30   # screen-curtain gap thickness [m]
+
+# Ventilation ACH (stack + wind pressure)
+Vent_Area = 0.15
+CD_Vent = 0.25
+CW_Vent = 0.09
+Vent_hd = 0.0   # inlet-outlet height difference [m]; kept explicitly even when 0
+ACH_night = 0.5
+ACH_min = ACH_night
+iter_num = 20
+u_int_min = 0.01
+u_int_max = 1.0
+
+# Exterior envelope longwave sky-view factors (diagnostic only; does not alter heat balance)
+sky_view_roof= 1.0
+sky_view_side = 0.5
+
+def air_properties(T_air_K: float, P: float = Patm):
+    """Air properties from CoolProp when available; otherwise use stable engineering fallbacks."""
+    T = float(max(T_air_K, 200.0))
+    P = float(P)
+    if coolprop_use:
+        try:
+            rho = float(PropsSI("D", "T", T, "P", P, "Air"))
+            cp = float(PropsSI("C", "T", T, "P", P, "Air"))
+            k = float(PropsSI("L", "T", T, "P", P, "Air"))
+            mu = float(PropsSI("V", "T", T, "P", P, "Air"))
+            if all(np.isfinite(v) and v > 0 for v in (rho, cp, k, mu)):
+                return rho, cp, k, mu
+        except Exception:
+            pass
+    rho = float(P / (R_air * T))
+    cp = 1006.0
+    k = 0.024 + 7.0e-5 * (T - 273.15)
+    mu0 = 1.716e-5
+    T0 = 273.15
+    S = 111.0
+    mu = mu0 * ((T / T0) ** 1.5) * (T0 + S) / (T + S)
+    return rho, cp, k, mu
+
+
+def h_solution_from_Nu_flatplate(T_air_K: float, u_int: float, L: float = solution_surface_length):
+    """Flat-plate forced convection: h = Nu*k_air/L (k_air is AIR thermal conductivity)."""
+    rho, cp, k_air, mu = air_properties(T_air_K)
+    u = max(float(u_int), 0.05)   # m/s lower bound for stability
+    Lc = max(float(L), 1e-3)      # m
+    Re = (rho * u * Lc) / max(mu, 1e-12)
+    Pr = (cp * mu) / max(k_air, 1e-12)
+    Re_crit = 5e5
+    if Re <= Re_crit:
+        Nu = 0.664 * (Re ** 0.5) * (Pr ** (1.0 / 3.0))
+    else:
+        Nu = (0.037 * (Re ** 0.8) - 871.0) * (Pr ** (1.0 / 3.0))
+        Nu = max(float(Nu), 0.0)
+    h = (Nu * k_air) / Lc  # W/m2/K
+    h = max(float(h), 0.5)  # lower bound
+    return float(h), float(Re), float(Pr), float(Nu)
+
+
+def moist_air_density_coolprop(T_air_K: float, RH_frac: float, P: float = Patm) -> float:
+    T = float(max(T_air_K, 200.0))
+    RH = float(np.clip(RH_frac, 0.0, 1.0))
+    if coolprop_use:
+        try:
+            rho = float(HAPropsSI("Vha", "T", T, "P", float(P), "R", RH))
+            if np.isfinite(rho) and rho > 0:
+                return float(1.0 / rho)
+        except Exception:
+            pass
+    pv = actual_vapor_pressure_Pa(T, RH)
+    pd = max(float(P) - pv, 1e-6)
+    R_v = 461.495
+    rho = pd / (R_air * T) + pv / (R_v * T)
+    return float(max(rho, 1e-9))
+
+
+def saturation_vapor_pressure_fallback_Pa(T_K: float) -> float:
+    Tc = float(T_K - 273.15)
+    return 610.94 * math.exp((17.625 * Tc) / (Tc + 243.04))
+
+
+def saturation_vapor_pressure_Pa(T_K: float) -> float:
+    T = float(max(T_K, 200.0))
+    if coolprop_use:
+        try:
+            psat = float(PropsSI("P", "T", T, "Q", 0, "Water"))
+            if np.isfinite(psat) and psat > 0:
+                return psat
+        except Exception:
+            pass
+    return saturation_vapor_pressure_fallback_Pa(T)
+
+
+def actual_vapor_pressure_Pa(T_K: float, RH_frac: float) -> float:
+    RH = float(np.clip(RH_frac, 0.0, 1.0))
+    return float(RH * saturation_vapor_pressure_Pa(T_K))
+
+
+def vpd_Pa_from_T_RH_coolprop(T_air_K: float, RH_frac: float) -> float:
+    RH = float(np.clip(RH_frac, 0.0, 1.0))
+    es = saturation_vapor_pressure_Pa(T_air_K)
+    return float(max(es * (1.0 - RH), 0.0))
+
+
+def vpd_leaf_air_Pa(Tleaf_K: float, Tair_K: float, RH_air_frac: float) -> float:
+    """Leaf-air VPD using leaf saturation vapor pressure and room-air actual vapor pressure."""
+    RH = float(np.clip(RH_air_frac, 0.0, 1.0))
+    e_air = RH * saturation_vapor_pressure_Pa(Tair_K)
+    e_sat_leaf = saturation_vapor_pressure_Pa(Tleaf_K)
+    return float(max(e_sat_leaf - e_air, 0.0))
+
+
+def dry_air_molar_density(T_K: float, P: float = Patm, e_w: float = 0.0) -> float:
+    """Dry-air molar density [mol m-3] using dry-air partial pressure (P - e_w)."""
+    P_dry = max(float(P) - max(float(e_w), 0.0), 1.0)
+    return float(P_dry / (R_univ * max(float(T_K), 200.0)))
+
+
+def latent_heat_vaporization(T_K: float) -> float:
+    T = float(max(T_K, 200.0))
+    if coolprop_use:
+        try:
+            h_v = float(PropsSI("H", "T", T, "Q", 1, "Water"))
+            h_l = float(PropsSI("H", "T", T, "Q", 0, "Water"))
+            h_fg = h_v - h_l
+            if np.isfinite(h_fg) and h_fg > 0:
+                return h_fg
+        except Exception:
+            pass
+    Tc = float(T - 273.15)
+    return (2501.0 - 2.361 * Tc) * 1000.0
+
+
+def arrhenius(Tk: float, k25: float, Ea: float) -> float:
+    Tk = max(float(Tk), 200.0)
+    return float(k25 * math.exp(Ea * (Tk - 298.15) / (298.15 * R_univ * Tk)))
+
+
+def peaked_arrhenius(Tk: float, k25: float, Ea: float, dS: float, Hd: float) -> float:
+    Tk = max(float(Tk), 200.0)
+    num = math.exp(Ea * (Tk - 298.15) / (298.15 * R_univ * Tk))
+    den = 1.0 + math.exp((Tk * dS - Hd) / (Tk * R_univ))
+    den_ref = 1.0 + math.exp((298.15 * dS - Hd) / (298.15 * R_univ))
+    return float(k25 * num * den_ref / den)
+
+
+def electron_transport_rate_fvcb(ppfd: float, jmax_t: float, phi: float = PHI_J, theta_j: float = THETA_J) -> float:
+    I = max(float(ppfd), 0.0)
+    if I <= 0.0:
+        return 0.0
+    a = phi * I + float(jmax_t)
+    disc = max(a * a - 4.0 * float(theta_j) * phi * I * float(jmax_t), 0.0)
+    return float((a - math.sqrt(disc)) / (2.0 * float(theta_j)))
+
+
+def smooth_min_quadratic(a_val: float, b_val: float, theta_a: float = THETA_A) -> float:
+    s = float(a_val + b_val)
+    disc = max(s * s - 4.0 * float(theta_a) * float(a_val) * float(b_val), 0.0)
+    return float((s - math.sqrt(disc)) / (2.0 * float(theta_a)))
+
+
+def internal_ppfd_umol(radSolar_out_Wm2: float, transGlass: float) -> float:
+    rad = max(float(radSolar_out_Wm2), 0.0)
+    tg = float(np.clip(transGlass, 0.0, 1.0))
+    return float(rad * tg * PAR_frac * unit_PAR)
+
+
+def beer_lambert_fint(LAI_val: float, k: float = k_sw) -> float:
+    return float(1.0 - math.exp(-float(k) * max(float(LAI_val), 0.0)))
+
+
+def ppm_to_humidity_ratio(T_K: float, RH_frac: float, P: float = Patm) -> float:
+    RH = float(np.clip(RH_frac, 0.0, 1.0))
+    p_sat = saturation_vapor_pressure_Pa(max(float(T_K), 273.15))
+    pv = RH * p_sat
+    return float(0.622 * pv / max(P - pv, 1e-9))
+
+
+def humidity_ratio_to_rh(T_K: float, W: float, P: float = Patm) -> float:
+    Wc = max(float(W), 0.0)
+    p_sat = saturation_vapor_pressure_Pa(max(float(T_K), 273.15))
+    pv = (Wc * P) / max(Wc + 0.622, 1e-12)
+    return float(np.clip(pv / max(p_sat, 1e-9), 0.0, 1.0))
+
+def boundary_layer_conductance_paper(u_canopy: float, dleaf: float) -> float:
+    """Paper Eq. (17): leaf boundary layer conductance for heat transfer [mol m-2 s-1]."""
+    u = max(float(u_canopy), 1e-6)
+    d = max(float(dleaf), 1e-6)
+    return float(0.21 * math.sqrt(u / d))
+
+
+def _leaf_fvcb_net_assimilation(Ci_ppm: float, Vcmax_T: float, J_T: float, Gamma_T: float,
+                               Kc_T: float, Ko_T: float, O: float, Rd_T: float) -> float:
+    """Leaf net assimilation [umol m-2 s-1] as a function of intercellular CO2 Ci [ppm]."""
+    Ci = max(float(Ci_ppm), 1.0)
+    Ac = Vcmax_T * (Ci - Gamma_T) / max(Ci + Kc_T * (1.0 + O / max(Ko_T, 1e-9)), 1e-9) - Rd_T
+    Aj = J_T * (Ci - Gamma_T) / max(4.0 * Ci + 8.0 * Gamma_T, 1e-9) - Rd_T
+    return float(smooth_min_quadratic(Ac, Aj, theta_a=THETA_A))
+
+
+def jarvis_leaf_resistance(ppfd_leaf: float, Tleaf_K: float, Ca_ppm: float, VPD_kPa: float,
+                           rs_min_leaf_s_m: float = RSMIN_LEAF) -> Tuple[float, float]:
+    """Stanghellini/Jarvis-style leaf stomatal resistance [s m-1] and equivalent gsw [mol m-2 s-1]."""
+    I = max(float(ppfd_leaf), 0.0)
+    Tc = float(Tleaf_K - 273.15)
+    Ca = max(float(Ca_ppm), 1.0)
+    D = max(float(VPD_kPa), 0.0)
+
+    f_R = (I + 4.3) / max(I + 0.54, 1e-9)
+    f_T = 1.0 + 0.023 * ((Tc - 24.5) ** 2)
+    f_D = (1.0 + 4.3 * (D ** 2)) if D < 0.8 else 3.8
+    f_CO2 = (1.0 + 6.1e-7 * ((Ca - 200.0) ** 2)) if Ca < 1100.0 else 1.5
+
+    r_leaf = float(max(rs_min_leaf_s_m * f_R * f_T * f_D * f_CO2, 1e-6))
+    gsw = float(max(1.0 / (0.0224 * r_leaf), 1e-9))
+    return r_leaf, gsw
+
+
+def stanghellini_effective_lai(LAI_val: float) -> float:
+    LAI = max(float(LAI_val), 0.0)
+    if LAI <= 2.0:
+        return float(LAI)
+    if LAI < 4.0:
+        return 2.0
+    return float(0.5 * LAI)
+
+
+def solve_leaf_fvcb_jarvis(ppfd_leaf: float, Tleaf_K: float, Ca_ppm: float, VPD_kPa: float,
+                           u_canopy: float, dleaf_m: float, rs_min_leaf_s_m: float = RSMIN_LEAF):
+    """
+    Leaf-scale FvCB assimilation with Jarvis stomatal resistance.
+    Mesophyll conductance is assumed infinite, so Cc = Ci.
+    A simple Ci/Ca closure is used to avoid the Medlyn coupling while keeping the original FvCB core.
+    """
+    I = max(float(ppfd_leaf), 0.0)
+    Ca = max(float(Ca_ppm), 1.0)
+    D = max(float(VPD_kPa), 1e-6)
+
+    Vcmax_T = peaked_arrhenius(Tleaf_K, VCMAX25, EA_VCMAX, DS_VCMAX, HD_VCMAX)
+    Jmax_T = peaked_arrhenius(Tleaf_K, JMAX25, EA_JMAX, DS_JMAX, HD_JMAX)
+    Kc_T = arrhenius(Tleaf_K, KC25, EA_KC)
+    Ko_T = arrhenius(Tleaf_K, KO25, EA_KO)
+    Gamma_T = arrhenius(Tleaf_K, GAMMA25, EA_GAMMA)
+    Rn_T = arrhenius(Tleaf_K, RN25, EA_RN)
+    gah = boundary_layer_conductance_paper(u_canopy, dleaf_m)
+
+    r_leaf, gsw = jarvis_leaf_resistance(I, Tleaf_K, Ca, D, rs_min_leaf_s_m=rs_min_leaf_s_m)
+
+    if I <= 1e-9:
+        Rd_T = Rn_T
+        return {
+            "A_leaf_net": float(-Rd_T),
+            "A_leaf_gross": 0.0,
+            "Rd_T": float(Rd_T),
+            "J_T": 0.0,
+            "Vcmax_T": float(Vcmax_T),
+            "gsw": float(gsw),
+            "gah": float(gah),
+            "Cs": float(Ca),
+            "Cc": float(Ca),
+            "r_leaf": float(r_leaf),
+        }
+
+    Rd_T = 0.4 * Rn_T
+    J_T = electron_transport_rate_fvcb(I, Jmax_T, phi=PHI_J, theta_j=THETA_J)
+    O = O2_MIX
+
+    ci_frac = 0.70 if D <= 1.0 else max(0.55, 0.70 - 0.05 * (D - 1.0))
+    Ci = float(max(min(ci_frac * Ca, Ca - 1.0), 1.0))
+    A_leaf_net = _leaf_fvcb_net_assimilation(Ci, Vcmax_T, J_T, Gamma_T, Kc_T, Ko_T, O, Rd_T)
+    A_leaf_gross = float(max(A_leaf_net + Rd_T, 0.0))
+    Cs = float(Ca)
+    Cc = float(Ci)
+
+    return {
+        "A_leaf_net": float(A_leaf_net),
+        "A_leaf_gross": float(A_leaf_gross),
+        "Rd_T": float(Rd_T),
+        "J_T": float(J_T),
+        "Vcmax_T": float(Vcmax_T),
+        "gsw": float(gsw),
+        "gah": float(gah),
+        "Cs": float(Cs),
+        "Cc": float(Cc),
+        "r_leaf": float(r_leaf),
+    }
+
+
+def canopy_photosynthesis_textbook(ppfd_above: float, LAI_val: float, Tleaf_K: float, Ca_ppm: float,
+                                       VPD_kPa: float, u_canopy: float, dleaf_m: float):
+    """
+    Canopy photosynthesis using leaf-scale FvCB assimilation with Jarvis stomatal resistance,
+    while retaining the Beer-Lambert canopy scaling from the original code.
+    Returns:
+      A_can_net, A_leaf_net, ppfd_canopy_abs, f_int, A_can_gross, R_can, J_leaf, Vcmax_T, Cc_leaf, Cs_leaf, gsw_leaf
+    """
+    LAI_eff = max(float(LAI_val), 0.0)
+    f_int = beer_lambert_fint(LAI_eff, k=k_sw)
+    ppfd_canopy_abs = max(float(ppfd_above), 0.0) * f_int
+
+    leaf_state = solve_leaf_fvcb_jarvis(
+        ppfd_leaf=(ppfd_canopy_abs / LAI_eff) if LAI_eff > 1e-9 else 0.0,
+        Tleaf_K=Tleaf_K,
+        Ca_ppm=Ca_ppm,
+        VPD_kPa=VPD_kPa,
+        u_canopy=u_canopy,
+        dleaf_m=dleaf_m,
+        rs_min_leaf_s_m=RSMIN_LEAF,
+    )
+
+    if LAI_eff <= 1e-9:
+        return (
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            float(leaf_state["J_T"]), float(leaf_state["Vcmax_T"]),
+            float(max(Ca_ppm, 1.0)), float(max(Ca_ppm, 1.0)), float(leaf_state["gsw"])
+        )
+
+    A_leaf_net = float(leaf_state["A_leaf_net"])
+    A_leaf_gross = float(leaf_state["A_leaf_gross"])
+    Rd_T = float(leaf_state["Rd_T"])
+
+    A_can_gross = A_leaf_gross * LAI_eff
+    R_can = Rd_T * LAI_eff
+    A_can_net = A_leaf_net * LAI_eff
+    return (
+        float(A_can_net), float(A_leaf_net), float(ppfd_canopy_abs), float(f_int),
+        float(A_can_gross), float(R_can), float(leaf_state["J_T"]), float(leaf_state["Vcmax_T"]),
+        float(leaf_state["Cc"]), float(leaf_state["Cs"]), float(leaf_state["gsw"])
+    )
+
+
+def stomatal_and_canopy_resistance(gsw_mol_m2_s: float, LAI_val: float):
+    gsw_eff = max(float(gsw_mol_m2_s), 1e-9)
+    r_leaf = 1.0 / (0.0224 * gsw_eff)
+    LAI_eff = max(stanghellini_effective_lai(LAI_val), 1e-9)
+    r_canopy = r_leaf / LAI_eff
+    return float(r_leaf), float(r_canopy)
+
+
+
+# Removed unused legacy helper: canopy_heat_transfer_coeff
+
+# Removed unused legacy helper: compute_Rns
+def compute_Tsky_Swinbank_cloud_single(Tair_for_dew_K, RH_frac, Toutdoor_K, cloud_fraction):
+    """
+    Swinbank clear-sky emissivity + Walton cloud correction.
+    Signature kept compatible with the previous Clark-Allen function:
+      Tair_for_dew_K : unused, kept for compatibility
+      RH_frac        : unused, kept for compatibility
+      Toutdoor_K     : outdoor air temperature [K]
+      cloud_fraction : opaque sky cover fraction [0-1]
+    Return:
+      effective sky temperature [K]
+    """
+    Ta_K = float(max(Toutdoor_K, 1.0))
+    cloud_frac = float(np.clip(cloud_fraction, 0.0, 1.0))
+
+    # Swinbank clear-sky emissivity (equivalent form of Tsky = 0.0552 * Ta^1.5)
+    eps_sky_clear = 9.37e-6 * (Ta_K ** 2)
+    eps_sky_clear = float(np.clip(eps_sky_clear, 0.0, 1.0))
+
+    # Opaque sky cover in tenths (Walton / EnergyPlus-style cloud correction)
+    N10 = float(np.clip(cloud_frac * 10.0, 0.0, 10.0))
+    cloud_factor = 1.0 + 0.0224 * N10 - 0.0035 * (N10 ** 2) + 0.00028 * (N10 ** 3)
+    eps_sky = float(np.clip(eps_sky_clear * cloud_factor, 0.0, 1.0))
+
+    return float((eps_sky ** 0.25) * Ta_K)
+
+
+
+def cover_inner_convective_htc(T_air_K: float, T_surf_K: float, surface_name: str) -> float:
+    """
+    Literature-style indoor convective HTC for the innermost cover layer.
+    - Screen / curtain: h = 1.7 * |dT|^0.33
+    - Film: use the same temperature-difference form here because roof slope angle
+      is not explicitly defined in this code.
+    """
+    dT = max(abs(float(T_air_K) - float(T_surf_K)), 0.1)
+    h = 1.7 * (dT ** 0.33)
+    return float(max(h, 0.5))
+
+
+def gap_nusselt_horizontal(T_hot_K: float, T_cold_K: float, gap_m: float) -> float:
+    """
+    Simple natural-convection correlation for an enclosed horizontal air layer.
+    Returns Nu >= 1.0.
+    The current greenhouse layers are assumed horizontal.
+    """
+    gap = max(float(gap_m), 1e-4)
+    Tm = max(0.5 * (float(T_hot_K) + float(T_cold_K)), 200.0)
+    rho, cp, k_air, mu = air_properties(Tm)
+    nu = mu / max(rho, 1e-12)
+    alpha = k_air / max(rho * cp, 1e-12)
+    beta = 1.0 / Tm
+    dT = abs(float(T_hot_K) - float(T_cold_K))
+    Ra = ga * beta * dT * (gap ** 3) / max(nu * alpha, 1e-20)
+    Nu = max(1.0, 1.0 + 0.27 * (max(Ra, 0.0) ** 0.25))
+    return float(Nu)
+
+
+def gap_convective_htc(T_a_K: float, T_b_K: float, gap_m: float):
+    """Gap convection coefficient h = Nu*k_air/d for enclosed horizontal air layer."""
+    gap = max(float(gap_m), 1e-4)
+    Tm = max(0.5 * (float(T_a_K) + float(T_b_K)), 200.0)
+    _, _, k_air, _ = air_properties(Tm)
+    Nu = gap_nusselt_horizontal(T_a_K, T_b_K, gap)
+    h = (Nu * k_air) / gap
+    return float(max(h, 0.05)), float(Tm), float(Nu)
+
+
+def gap_longwave_hr(T1_K: float, T2_K: float, eps1: float, eps2: float) -> float:
+    """Linearized longwave radiation coefficient between two parallel gray surfaces [W m-2 K-1]."""
+    Tm = max(0.5 * (float(T1_K) + float(T2_K)), 200.0)
+    e1 = float(np.clip(eps1, 1e-6, 0.999999))
+    e2 = float(np.clip(eps2, 1e-6, 0.999999))
+    denom = (1.0 / e1) + (1.0 / e2) - 1.0
+    return float(max(4.0 * Sigma * (Tm ** 3) / max(denom, 1e-9), 0.0))
+
+
+def compute_cover_condensation_kgph(T_air_K: float,
+                                    RH_in_frac: float,
+                                    T_cover_in_K: float,
+                                    h_cond_Wm2K: float,
+                                    area_cond_m2: float,
+                                    P: float = Patm) -> float:
+    """
+    Cover condensation rate [kg/h]
+    m_cond = xi * h_as * (Pv_air - Pv_sat(Tcover)) * A * 3600, if Pv_air > Pv_sat
+    """
+    if (not np.isfinite(T_cover_in_K)) or (not np.isfinite(h_cond_Wm2K)):
+        return 0.0
+
+    RH = float(np.clip(RH_in_frac, 0.0, 1.0))
+    Pv_air = actual_vapor_pressure_Pa(max(float(T_air_K), 273.15), RH)
+    Pv_sat_cov = saturation_vapor_pressure_Pa(max(float(T_cover_in_K), 273.15))
+    dPv = max(Pv_air - Pv_sat_cov, 0.0)
+    Wcond = cond_factor * max(float(h_cond_Wm2K), 0.0) * dPv * max(float(area_cond_m2), 0.0) * 3600.0
+    return float(max(Wcond, 0.0))
+
+
+def solve_multilayer_cover_surfaces(
+    Ti_K, Te_K, RH_in_frac, u_out, cloud_frac, rad_Wm2,
+    use_screen: bool,
+    use_curtain: bool,
+    film_thickness_m: float = None,
+    max_iter: int = iter_num,
+    tol: float = 1e-3,
+):
+    """
+    Multi-layer cover solver with gap-air nodes.
+    Nodes are solved in steady-state for the active layers only.
+    Curtain use is determined entirely by the control logic before this solver is called.
+    Supports four cases without singular matrices:
+      1) film only
+      2) film + screen
+      3) film + curtain
+      4) film + screen + curtain
+    """
+    Ti = float(Ti_K); Te = float(Te_K)
+    RH = float(np.clip(RH_in_frac, 0.0, 1.0))
+    u = max(float(u_out), 0.0)
+    rad = max(float(rad_Wm2), 0.0)
+
+    Tsky = compute_Tsky_Swinbank_cloud_single(Te, 1.0, Te, float(cloud_frac))
+
+    def h_out_func(Tsurf):
+        dTe = max(abs(Tsurf - Te), 0.1)
+        return max(1.22 * (dTe ** 0.25) + 3.12 * (u ** 0.8), 1e-3)
+
+    film = LAYER_PROPS["PO필름"]
+    scr  = LAYER_PROPS["AL스크린"]
+    cur  = LAYER_PROPS["보온커튼"]
+
+    tf = film_thickness_m if film_thickness_m is not None else film.get("t", None)
+    if tf is None:
+        raise ValueError("PO필름 두께(t)가 None입니다. LAYER_PROPS['PO필름']['t']에 값을 넣어주세요.")
+    tf = float(tf)
+
+    G_f = float(film["k"]) / max(tf, 1e-12)
+    G_s = float(scr["k"])  / max(float(scr["t"]), 1e-12)
+    G_c = float(cur["k"])  / max(float(cur["t"]), 1e-12)
+    eps_f = float(np.clip(film["eps_lw"], 0.0, 0.9999))
+    eps_s = float(np.clip(scr["eps_lw"], 0.0, 0.9999))
+    eps_c = float(np.clip(cur["eps_lw"], 0.0, 0.9999))
+
+    I_f = rad
+    qsw_f = float(film["alpha_sw"]) * I_f
+    I_after_f = I_f * max(1.0 - float(film["alpha_sw"]), 0.0)
+    qsw_s = float(scr["alpha_sw"]) * I_after_f if use_screen else 0.0
+    I_after_s = I_after_f * max(1.0 - float(scr["alpha_sw"]), 0.0) if use_screen else I_after_f
+    qsw_c = float(cur["alpha_sw"]) * I_after_s if use_curtain else 0.0
+
+    if use_screen and use_curtain:
+        case = 'film_screen_curtain'
+        names = ['film_ext', 'film_in', 'gap_fs', 'screen_out', 'screen_in', 'gap_sc', 'curtain_out', 'curtain_in']
+    elif use_screen:
+        case = 'film_screen'
+        names = ['film_ext', 'film_in', 'gap_fs', 'screen_out', 'screen_in']
+    elif use_curtain:
+        case = 'film_curtain'
+        names = ['film_ext', 'film_in', 'gap_fc', 'curtain_out', 'curtain_in']
+    else:
+        case = 'film_only'
+        names = ['film_ext', 'film_in']
+
+    n = len(names)
+    idx = {name: i for i, name in enumerate(names)}
+    x = np.full(n, 0.5 * (Ti + Te), dtype=float)
+
+    h_in_eff = 1.0
+    h_in_surface_name = 'PO필름'
+    h_gap_fs_eff = np.nan
+    h_gap_sc_eff = np.nan
+    Tgap_fs = float('nan')
+    Tgap_sc = float('nan')
+
+    for _ in range(max_iter):
+        x_old = x.copy()
+
+        Tfilm_ext = x[idx['film_ext']]
+        Tfilm_in = x[idx['film_in']]
+
+        if case in ('film_screen', 'film_screen_curtain'):
+            Tgap_fs = x[idx['gap_fs']]
+            Tscreen_out = x[idx['screen_out']]
+            Tscreen_in = x[idx['screen_in']]
+        else:
+            Tscreen_out = Tscreen_in = float('nan')
+            Tgap_fs = float('nan')
+
+        if case == 'film_screen_curtain':
+            Tgap_sc = x[idx['gap_sc']]
+            Tcurtain_out = x[idx['curtain_out']]
+            Tcurtain_in = x[idx['curtain_in']]
+        elif case == 'film_curtain':
+            Tgap_sc = x[idx['gap_fc']]
+            Tcurtain_out = x[idx['curtain_out']]
+            Tcurtain_in = x[idx['curtain_in']]
+        else:
+            Tcurtain_out = Tcurtain_in = float('nan')
+            Tgap_sc = float('nan')
+
+        if case in ('film_screen_curtain', 'film_curtain'):
+            T_inner_est = Tcurtain_in
+            h_in_surface_name = '보온커튼'
+        elif case == 'film_screen':
+            T_inner_est = Tscreen_in
+            h_in_surface_name = 'AL스크린'
+        else:
+            T_inner_est = Tfilm_in
+            h_in_surface_name = 'PO필름'
+
+        h_in_eff = cover_inner_convective_htc(Ti, T_inner_est, h_in_surface_name)
+        h_out = h_out_func(Tfilm_ext)
+        h_rad_sky = float(max(4.0 * eps_f * Sigma * (max(Tfilm_ext, 1.0) ** 3), 1e-6))
+        q_rad_exact = eps_f * Sigma * (Tfilm_ext**4 - Tsky**4)
+        Tr = Tfilm_ext - q_rad_exact / max(h_rad_sky, 1e-12)
+
+        if case in ('film_screen', 'film_screen_curtain'):
+            h_gap_fs_conv, _, _ = gap_convective_htc(Tfilm_in, Tscreen_out, gap_F_S)
+            h_gap_fs_eff = h_gap_fs_conv + gap_longwave_hr(Tfilm_in, Tscreen_out, eps_f, eps_s)
+        if case == 'film_screen_curtain':
+            h_gap_sc_conv, _, _ = gap_convective_htc(Tscreen_in, Tcurtain_out, gap_S_C)
+            h_gap_sc_eff = h_gap_sc_conv + gap_longwave_hr(Tscreen_in, Tcurtain_out, eps_s, eps_c)
+        elif case == 'film_curtain':
+            h_gap_sc_conv, _, _ = gap_convective_htc(Tfilm_in, Tcurtain_out, gap_S_C)
+            h_gap_sc_eff = h_gap_sc_conv + gap_longwave_hr(Tfilm_in, Tcurtain_out, eps_f, eps_c)
+        else:
+            h_gap_sc_eff = np.nan
+
+        A = np.zeros((n, n), dtype=float)
+        b = np.zeros(n, dtype=float)
+
+        i0 = idx['film_ext']
+        i1 = idx['film_in']
+        A[i0, i0] = G_f + h_out + h_rad_sky
+        A[i0, i1] = -G_f
+        b[i0] = h_out * Te + h_rad_sky * Tr + qsw_f
+
+        if case == 'film_only':
+            A[i1, i0] = -G_f
+            A[i1, i1] = G_f + h_in_eff
+            b[i1] = h_in_eff * Ti
+
+        elif case == 'film_screen':
+            ig = idx['gap_fs']
+            iso = idx['screen_out']
+            isi = idx['screen_in']
+
+            A[i1, i0] = -G_f
+            A[i1, i1] = G_f + h_gap_fs_eff
+            A[i1, ig] = -h_gap_fs_eff
+
+            A[ig, ig] = h_gap_fs_eff + h_gap_fs_eff
+            A[ig, i1] = -h_gap_fs_eff
+            A[ig, iso] = -h_gap_fs_eff
+
+            A[iso, ig] = -h_gap_fs_eff
+            A[iso, iso] = h_gap_fs_eff + G_s
+            A[iso, isi] = -G_s
+            b[iso] = qsw_s
+
+            A[isi, iso] = -G_s
+            A[isi, isi] = G_s + h_in_eff
+            b[isi] = h_in_eff * Ti
+
+        elif case == 'film_curtain':
+            ig = idx['gap_fc']
+            ico = idx['curtain_out']
+            ici = idx['curtain_in']
+
+            A[i1, i0] = -G_f
+            A[i1, i1] = G_f + h_gap_sc_eff
+            A[i1, ig] = -h_gap_sc_eff
+
+            A[ig, ig] = h_gap_sc_eff + h_gap_sc_eff
+            A[ig, i1] = -h_gap_sc_eff
+            A[ig, ico] = -h_gap_sc_eff
+
+            A[ico, ig] = -h_gap_sc_eff
+            A[ico, ico] = h_gap_sc_eff + G_c
+            A[ico, ici] = -G_c
+            b[ico] = qsw_c
+
+            A[ici, ico] = -G_c
+            A[ici, ici] = G_c + h_in_eff
+            b[ici] = h_in_eff * Ti
+
+        else:
+            ig = idx['gap_fs']
+            iso = idx['screen_out']
+            isi = idx['screen_in']
+            ig2 = idx['gap_sc']
+            ico = idx['curtain_out']
+            ici = idx['curtain_in']
+
+            A[i1, i0] = -G_f
+            A[i1, i1] = G_f + h_gap_fs_eff
+            A[i1, ig] = -h_gap_fs_eff
+
+            A[ig, ig] = h_gap_fs_eff + h_gap_fs_eff
+            A[ig, i1] = -h_gap_fs_eff
+            A[ig, iso] = -h_gap_fs_eff
+
+            A[iso, ig] = -h_gap_fs_eff
+            A[iso, iso] = h_gap_fs_eff + G_s
+            A[iso, isi] = -G_s
+            b[iso] = qsw_s
+
+            A[isi, iso] = -G_s
+            A[isi, isi] = G_s + h_gap_sc_eff
+            A[isi, ig2] = -h_gap_sc_eff
+
+            A[ig2, ig2] = h_gap_sc_eff + h_gap_sc_eff
+            A[ig2, isi] = -h_gap_sc_eff
+            A[ig2, ico] = -h_gap_sc_eff
+
+            A[ico, ig2] = -h_gap_sc_eff
+            A[ico, ico] = h_gap_sc_eff + G_c
+            A[ico, ici] = -G_c
+            b[ico] = qsw_c
+
+            A[ici, ico] = -G_c
+            A[ici, ici] = G_c + h_in_eff
+            b[ici] = h_in_eff * Ti
+
+        x = np.linalg.solve(A, b)
+
+        if np.max(np.abs(x - x_old)) < tol:
+            break
+
+    Tfilm_ext = float(x[idx['film_ext']])
+    Tfilm_in = float(x[idx['film_in']])
+    Tscreen_int = float(x[idx['screen_in']]) if case in ('film_screen', 'film_screen_curtain') else float('nan')
+    Tcurtain_int = float(x[idx['curtain_in']]) if case in ('film_curtain', 'film_screen_curtain') else float('nan')
+    Tgap_fs = float(x[idx['gap_fs']]) if case in ('film_screen', 'film_screen_curtain') else float('nan')
+    Tgap_sc = float(x[idx['gap_sc']]) if case == 'film_screen_curtain' else (float(x[idx['gap_fc']]) if case == 'film_curtain' else float('nan'))
+
+    return (
+        Tfilm_ext, Tfilm_in, Tscreen_int, Tcurtain_int,
+        float(h_in_eff), h_in_surface_name,
+        float(h_gap_fs_eff) if case in ('film_screen', 'film_screen_curtain') else float('nan'),
+        float(h_gap_sc_eff) if case in ('film_curtain', 'film_screen_curtain') else float('nan'),
+        Tgap_fs, Tgap_sc
+    )
+
+
+def compute_qFIR_kW_internal_multilayer(
+    Ti_K, Te_K, RH_in_frac, covers, areaHouse_, rad_Wm2,
+    u_out=1.0, cloud_frac=cloud_default,
+    film_thickness_m=None,
+):
+    use_screen = ("AL스크린" in covers)
+    use_curtain = ("보온커튼" in covers)
+
+    (
+        Tfilm_ext, Tfilm_in, Tscreen_int, Tcurtain_int, h_inner, h_inner_surface_name,
+        h_gap_fs, h_gap_sc, Tgap_fs, Tgap_sc
+    ) = solve_multilayer_cover_surfaces(
+        Ti_K=Ti_K, Te_K=Te_K, RH_in_frac=RH_in_frac,
+        u_out=u_out, cloud_frac=cloud_frac, rad_Wm2=rad_Wm2,
+        use_screen=use_screen, use_curtain=use_curtain,
+        film_thickness_m=film_thickness_m,
+    )
+
+    Tsky = compute_Tsky_Swinbank_cloud_single(float(Te_K), 1.0, float(Te_K), float(cloud_frac))
+    eps_f = float(np.clip(LAYER_PROPS["PO필름"]["eps_lw"], 0.0, 0.9999))
+    qFIR_kW = eps_f * Sigma * float(areaHouse_) * (Tfilm_ext**4 - Tsky**4) / 1000.0
+
+    return (
+        float(qFIR_kW), float(Tfilm_ext), float(Tfilm_in), float(Tscreen_int), float(Tcurtain_int),
+        float(h_inner), h_inner_surface_name, float(h_gap_fs), float(h_gap_sc), float(Tgap_fs), float(Tgap_sc)
+    )
+
+
+def compute_total_envelope_sky_loss_kW(
+    Tfilm_ext_K: float,
+    Tsky_K: float,
+    roof_area_m2: float,
+    side_area_m2: float,
+    eps_lw_cover: float,
+    sky_view_roof: float = sky_view_roof,
+    sky_view_side: float = sky_view_side,
+):
+    """
+    Diagnostic whole-envelope exterior longwave radiative cooling [kW]
+    = roof sky-loss + sidewall sky-loss.
+    This is added only as an output metric and does not modify the existing heat balance.
+    """
+    Tfilm = float(Tfilm_ext_K)
+    Tsky = float(Tsky_K)
+    eps = float(np.clip(eps_lw_cover, 0.0, 0.9999))
+
+    qlw_roof_W = sky_view_roof* eps * Sigma * float(roof_area_m2) * (Tfilm**4 - Tsky**4)
+    qlw_side_W = sky_view_side * eps * Sigma * float(side_area_m2) * (Tfilm**4 - Tsky**4)
+
+    qlw_total_kW = (qlw_roof_W + qlw_side_W) / 1000.0
+    return float(qlw_total_kW), float(qlw_roof_W / 1000.0), float(qlw_side_W / 1000.0)
+
+
+def calculate_covering_properties(screen_on, curtain_on):
+    covers = ['PO필름']
+    transGlass = 0.80
+
+    if float(screen_on) > 0.5:
+        covers.append('AL스크린')
+        transGlass *= 0.45
+
+    if float(curtain_on) > 0.5:
+        covers.append('보온커튼')
+
+    U_layer = {'PO필름': 5.1, 'AL스크린': 5.5, '보온커튼': 2.7}
+
+    Rt_roof = sum(1.0 / max(U_layer[c], 1e-9) for c in covers)
+    Ti = 1.0 / max(Rt_roof, 1e-12)
+    Ur = 1.2944 * Ti - 0.4205
+
+    side_covers = ['PO필름']
+    Rt_side = sum(1.0 / max(U_layer[c], 1e-9) for c in side_covers)
+    Ti_side = 1.0 / max(Rt_side, 1e-12)
+    Uw = 1.2944 * Ti_side - 0.4205
+
+    return float(Ur), float(Uw), float(transGlass), covers
+
+
+def dCin_dt_ppm_per_h(Cin_ppm: float, T_in_K: float, T_out_K: float, RH_in: float, RH_out: float, ach: float,
+                     ppfd_above: float, LAI: float, Tleaf_K: float, u_canopy: float,
+                     dleaf_m: float, C_out_ppm: float = Cout_ppm):
+    """CO2 rate equation [ppm h-1] using dry-air molar fractions + indoor/outdoor humidity from the weather data."""
+    chi_in = float(Cin_ppm) / 1e6
+    chi_out = float(C_out_ppm) / 1e6
+
+    e_w_in = actual_vapor_pressure_Pa(max(float(T_in_K), 273.15), RH_in)
+    e_w_out = actual_vapor_pressure_Pa(max(float(T_out_K), 273.15), RH_out)
+
+    c_dry_in = dry_air_molar_density(T_in_K, Patm, e_w_in)
+    c_dry_out = dry_air_molar_density(T_out_K, Patm, e_w_out)
+
+    F_vent_in = float(ach) * c_dry_out * chi_out
+    F_vent_out = -float(ach) * c_dry_in * chi_in
+    F_vent_net_mol_m3_h = F_vent_in + F_vent_out
+
+    D_kPa = vpd_leaf_air_Pa(Tleaf_K, T_in_K, RH_in) / 1000.0
+    (A_can_net, A_leaf_net, _ppfd_can_abs, _f_int, A_can_gross, R_can, J_leaf, Vcmax_T, Cc_est, Cs_est,
+     gsw_leaf) = canopy_photosynthesis_textbook(
+        ppfd_above=ppfd_above,
+        LAI_val=LAI,
+        Tleaf_K=Tleaf_K,
+        Ca_ppm=Cin_ppm,
+        VPD_kPa=D_kPa,
+        u_canopy=u_canopy,
+        dleaf_m=dleaf_m,
+    )
+
+    A_umol_s = float(A_can_net) * float(cropArea)
+    bio_volume = volumeHouse * VCeff_night if ppfd_above <= 1e-9 else volumeHouse
+    F_bio_mol_m3_h = -(A_umol_s * 1e-6 * 3600.0) / max(float(bio_volume), 1e-9)
+
+    F_total_mol_m3_h = F_vent_net_mol_m3_h + F_bio_mol_m3_h
+    dCin_dt = (F_total_mol_m3_h / max(c_dry_in, 1e-9)) * 1e6
+
+    info = dict(
+        A_can_net_umol=float(A_can_net),
+        A_leaf_net_umol=float(A_leaf_net),
+        A_can_gross_umol=float(A_can_gross),
+        R_can_umol=float(R_can),
+        Cc_ppm=float(Cc_est),
+        Cs_ppm=float(Cs_est),
+        gsw_mol=float(gsw_leaf),
+        J_leaf=float(J_leaf),
+        Vcmax_T=float(Vcmax_T),
+        F_vent_ppmph=float(F_vent_net_mol_m3_h / max(c_dry_in, 1e-9) * 1e6),
+        F_bio_ppmph=float(F_bio_mol_m3_h / max(c_dry_in, 1e-9) * 1e6),
+        c_dry_in_molm3=float(c_dry_in),
+    )
+    return float(dCin_dt), info
+
+
+def compute_internal_wind_from_ach(ach_value: float) -> float:
+    """Convert final ACH [h-1] to mean internal air speed [m s-1]."""
+    A_cross = max(widthHouse * heightHouse, 1e-12)
+    u_int = (float(ach_value) * volumeHouse) / (3600.0 * A_cross)
+    return float(np.clip(u_int, u_int_min, u_int_max))
+
+
+def determine_ach_and_internal_wind(T_air_K, RH_in_frac, T_out_K, RH_out_frac, wind_speed_out):
+    """
+    Variable ACH based on ventilation pressure difference.
+    ΔP = ΔP_stack + ΔP_wind
+    ΔP_stack = (ρo - ρi) * g * hd
+    ΔP_wind = 0.5 * ρo * Cw * U_out^2
+
+    Even when hd = 0, the stack-pressure term and its parameters are kept explicitly in the code.
+    Air density is computed with CoolProp humid-air properties when available.
+    The final on/off application logic is handled outside this function.
+    """
+    rho_out = moist_air_density_coolprop(T_out_K, RH_out_frac, P=Patm)
+    rho_in = moist_air_density_coolprop(T_air_K, RH_in_frac, P=Patm)
+    A_vent = float(areaHouse) * float(Vent_Area)
+    U_out = max(float(wind_speed_out), 0.0)
+    hd = float(Vent_hd)
+
+    deltaP_stack = (rho_out - rho_in) * float(ga) * hd
+    deltaP_wind = 0.5 * rho_out * float(CW_Vent) * (U_out ** 2)
+    deltaP = deltaP_stack + deltaP_wind
+    deltaP_eff = max(deltaP, 0.0)
+
+    if (A_vent <= 0.0) or (deltaP_eff <= 0.0):
+        ach = float(ACH_min)
+    else:
+        Q_vent_m3s = float(CD_Vent) * A_vent * math.sqrt(max(2.0 * deltaP_eff / max(rho_out, 1e-12), 0.0))
+        ach = max((Q_vent_m3s / max(volumeHouse, 1e-12)) * 3600.0, ACH_min)
+
+    u_int = compute_internal_wind_from_ach(ach)
+    return float(ach), float(u_int)
+
+
+def stanghellini_aerodynamic_resistance(T_air_K: float, T_leaf_K: float, u_canopy: float, dleaf_m: float) -> float:
+    """Stanghellini mixed-convection aerodynamic resistance [s m-1]."""
+    U = max(float(u_canopy), 1e-4)
+    l = max(float(dleaf_m), 1e-6)
+    dT = abs(float(T_leaf_K) - float(T_air_K))
+    ra = 1174.0 * (l ** 0.5) * max(l * dT + 207.0 * (U ** 2), 1e-12) ** (-0.25)
+    return float(max(ra, 1e-6))
+
+
+def stanghellini_radiative_resistance(T_air_K: float) -> float:
+    rho, cp, *_ = air_properties(T_air_K)
+    return float(max((rho * cp) / max(4.0 * Sigma * (max(float(T_air_K), 200.0) ** 3), 1e-12), 1e-9))
+
+
+def compute_stanghellini_net_radiation(radSolar_out, transGlass, T_air_K, T_leaf_K, LAI_val: float = 1.0):
+    Is = float(max(radSolar_out, 0.0)) * float(np.clip(transGlass, 0.0, 1.0))
+    Rns = 0.07 * Is
+    rho, cp, *_ = air_properties(T_air_K)
+    rR = stanghellini_radiative_resistance(T_air_K)
+    Rnl = 0.16 * rho * cp * ((float(T_air_K) - float(T_leaf_K)) / max(rR, 1e-9))
+    Rn = float(Rns - Rnl)
+    return float(Rn), float(Rns), float(Rnl), float(rR)
+
+
+def compute_latent_flux_stanghellini_canopy(T_air_K, RH_in_frac, Rn_Wm2, ra_s_m, rc_s_m, area_m2, LAI_val: float):
+    RH = float(np.clip(RH_in_frac, 0.0, 1.0))
+    T_air_C = float(T_air_K - 273.15)
+
+    VPD_Pa = vpd_Pa_from_T_RH_coolprop(T_air_K, RH)
+
+    p_sat = saturation_vapor_pressure_Pa(max(T_air_K, 273.15))
+    e_s_kPa = p_sat / 1000.0
+    Delta_kPa = 4098.0 * e_s_kPa / ((T_air_C + 237.3) ** 2)
+    Delta = Delta_kPa * 1000.0  # Pa K-1
+
+    gamma = 66.0  # Pa K-1
+    rho, cp, *_ = air_properties(T_air_K)
+    ra_leaf = max(float(ra_s_m), 1e-9)
+    rc_eff = max(float(rc_s_m), 0.0)
+    LAI_eff = max(float(LAI_val), 1e-9)
+    G = 0.0
+
+    numerator = (Delta / gamma) * (float(Rn_Wm2) - G) + (2.0 * LAI_eff * rho * cp * VPD_Pa) / (gamma * ra_leaf)
+    denominator = 1.0 + (Delta / gamma) + (rc_eff / ra_leaf)
+    lambdaE = numerator / max(denominator, 1e-12)
+
+    h_fg = latent_heat_vaporization(T_air_K)
+    lambdaE = max(lambdaE, 0.0)
+    mass_flux = lambdaE / max(h_fg, 1e-12)  # kg m-2 s-1
+    Wet = max(mass_flux * float(area_m2) * 3600.0, 0.0)  # kg/h
+    return float(lambdaE), float(Wet), float(h_fg), float(VPD_Pa), float(ra_leaf)
+
+
+def compute_Qcrop_sensible_kW(T_air_K, ra_s_m, area_m2, deltaT_leaf_air_val, LAI_val: float):
+    rho, cp, *_ = air_properties(T_air_K)
+    ra_eff = max(float(ra_s_m), 1e-9)
+    LAI_eff = max(float(LAI_val), 1e-9)
+    H_Wm2 = (2.0 * LAI_eff * rho * cp / ra_eff) * float(deltaT_leaf_air_val)
+    return float(H_Wm2 * float(area_m2) / 1000.0), float(H_Wm2)
+
+
+def rebuild_to_regular_1hour_grid(df: pd.DataFrame, time_col: str = "날짜&시간") -> pd.DataFrame:
+    out = df.copy()
+    out[time_col] = pd.to_datetime(out[time_col], errors="coerce")
+    out = out.dropna(subset=[time_col]).sort_values(time_col)
+    out = out.drop_duplicates(subset=[time_col], keep="first")
+
+    if out.empty:
+        raise ValueError("유효한 날짜&시간 데이터가 없습니다.")
+
+    full_index = pd.date_range(
+        start=out[time_col].iloc[0],
+        end=out[time_col].iloc[-1],
+        freq="1h",
+    )
+
+    out = out.set_index(time_col).reindex(full_index)
+    out.index.name = time_col
+
+    numeric_cols = out.select_dtypes(include=[np.number]).columns.tolist()
+    if numeric_cols:
+        out[numeric_cols] = out[numeric_cols].interpolate(method="time", limit_direction="both")
+        out[numeric_cols] = out[numeric_cols].ffill().bfill()
+
+    non_numeric_cols = [c for c in out.columns if c not in numeric_cols]
+    if non_numeric_cols:
+        out[non_numeric_cols] = out[non_numeric_cols].ffill().bfill()
+
+    out = out.reset_index().rename(columns={"index": time_col})
+    return out
+
+
+def run_integrated_TRH_CO2_model(input_xlsx: str) -> pd.DataFrame:
+    df = pd.read_excel(input_xlsx)
+
+    if "날짜&시간" not in df.columns and "날짜&시간ㅂ" in df.columns:
+        df = df.rename(columns={"날짜&시간ㅂ": "날짜&시간"})
+
+    required = ["날짜&시간", "외부 온도", "외부 습도", "일사"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"입력 엑셀에 필수 컬럼이 없습니다: {missing}")
+
+    df = rebuild_to_regular_1hour_grid(df, time_col="날짜&시간")
+
+    for col in ["외부 온도", "외부 습도", "일사"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").interpolate(limit_direction="both").ffill().bfill()
+
+    df["날짜&시간"] = pd.to_datetime(df["날짜&시간"])
+    n = len(df)
+
+    t0 = df["날짜&시간"].iloc[0]
+    elapsed_days = (df["날짜&시간"] - t0).dt.total_seconds().to_numpy(dtype=float) / 86400.0
+
+    growth_ratio = np.clip(elapsed_days / growth_days, 0.0, 1.0)
+
+    LAI_series = LAI_init + (LAI_max - LAI_init) * growth_ratio
+    Ld_series = Ld_init + (Ld_max - Ld_init) * growth_ratio
+    Lw_series = Lw_init + (Lw_max - Lw_init) * growth_ratio
+
+    if n > 1:
+        dt_sec = np.full(n, 3600.0, dtype=float)
+        dt_sec[0] = 3600.0
+    else:
+        dt_sec = np.array([3600.0], dtype=float)
+
+    if "외부 풍속" in df.columns:
+        u_out = pd.to_numeric(df["외부 풍속"], errors="coerce").interpolate(limit_direction="both").ffill().bfill().to_numpy(float)
+    elif "풍속" in df.columns:
+        u_out = pd.to_numeric(df["풍속"], errors="coerce").interpolate(limit_direction="both").ffill().bfill().to_numpy(float)
+    else:
+        u_out = np.full(n, 1.0, dtype=float)
+
+    if "전운량" in df.columns:
+        cloud_raw = pd.to_numeric(df["전운량"], errors="coerce").interpolate(limit_direction="both").ffill().bfill().to_numpy(float)
+        cloud_frac = np.clip(cloud_raw / 10.0, 0.0, 1.0)
+    elif "운량" in df.columns:
+        cloud_raw = pd.to_numeric(df["운량"], errors="coerce").interpolate(limit_direction="both").ffill().bfill().to_numpy(float)
+        cloud_frac = np.clip(cloud_raw / 10.0, 0.0, 1.0)
+    else:
+        cloud_frac = np.full(n, cloud_default, dtype=float)
+
+    Tout = df["외부 온도"].to_numpy(float) + 273.15
+    RHout = np.clip(df["외부 습도"].to_numpy(float) / 100.0, 0.0, 1.0)
+    rad = df["일사"].to_numpy(float)
+
+
+    if "감우" in df.columns:
+        rain_on = pd.to_numeric(df["감우"], errors="coerce").fillna(0.0).to_numpy(float)
+    elif "강우" in df.columns:
+        rain_on = pd.to_numeric(df["강우"], errors="coerce").fillna(0.0).to_numpy(float)
+    else:
+        rain_on = np.zeros(n, dtype=float)
+    rain_on = np.where(rain_on > 0.5, 1.0, 0.0)
+
+    screen_on = np.where(rad > 300.0, 1.0, 0.0)
+
+    Troom = np.full(n, np.nan, dtype=float)
+    RHin = np.full(n, np.nan, dtype=float)
+    W_state = np.full(n, np.nan, dtype=float)
+    Cin_ppm = np.full(n, np.nan, dtype=float)
+
+    ach = np.zeros(n)
+    u_int = np.zeros(n)
+    curtain_on = np.zeros(n)
+    rain_control = np.zeros(n)
+    Ur_values = np.zeros(n)
+    Uw_values = np.zeros(n)
+    transGlass_values = np.zeros(n)
+    covers_str = [""] * n
+
+    qRad_kW = np.zeros(n)
+    qRoof_kW = np.zeros(n)
+    qFloor_kW = np.zeros(n)
+    qSide_kW = np.zeros(n)
+    qVent_kW = np.zeros(n)
+    qLat_kW = np.zeros(n)
+    qFIR_kW = np.zeros(n)
+    Qlw_env_total_kW = np.zeros(n)
+    Qlw_env_roof_kW = np.zeros(n)
+    Qlw_env_side_kW = np.zeros(n)
+    Qlw_env_total_Wm2 = np.zeros(n)
+    QcropS_kW = np.zeros(n)
+    qt = np.zeros(n)
+
+    PPFD_above = np.zeros(n)
+    PPFD_canopy = np.zeros(n)
+    PPFD_canopy_absorbed = np.zeros(n)
+    A_leaf = np.zeros(n)
+    A_canopy = np.zeros(n)
+    Cs_ppm = np.zeros(n)
+    Cc_ppm = np.zeros(n)
+    gsw_series = np.zeros(n)
+    VPD_Pa = np.zeros(n)
+    A_canopy_gross = np.zeros(n)
+    R_canopy = np.zeros(n)
+    J_leaf_series = np.zeros(n)
+    Vcmax_leaf_series = np.zeros(n)
+    Cbio_kgph = np.zeros(n)
+    Cvent_kgph = np.zeros(n)
+    Cr_kgph = np.zeros(n)
+    Cbio_ppmph = np.zeros(n)
+    Cvent_ppmph = np.zeros(n)
+    Cr_ppmph = np.zeros(n)
+
+    Rn_Wm2 = np.zeros(n)
+    Rnl_crop_Wm2 = np.zeros(n)
+    lambdaE_Wm2 = np.zeros(n)
+    ra_leaf_s_m = np.zeros(n)
+    rs_s_m = np.zeros(n)
+    rhoAir_kgm3 = np.full(n, np.nan, dtype=float)
+    cAir_kJkgK = np.full(n, np.nan, dtype=float)
+    mHouse_kg = np.full(n, np.nan, dtype=float)
+    mHouse_dry_kg = np.full(n, np.nan, dtype=float)
+
+    Wtr_kgph = np.zeros(n)
+    Wev_kgph = np.zeros(n)
+    Wev_raw_kgph = np.zeros(n)
+    RHs_solution = np.full(n, np.nan, dtype=float)
+    hsolution_Wm2K = np.full(n, np.nan, dtype=float)
+    ra_solution_s_m = np.full(n, np.nan, dtype=float)
+    rc_s_m = np.zeros(n)
+    hs_Wm2K = np.zeros(n)
+    h_cover_in_Wm2K = np.zeros(n)
+    h_gap_fs_Wm2K = np.full(n, np.nan, dtype=float)
+    h_gap_sc_Wm2K = np.full(n, np.nan, dtype=float)
+    Wcond_cover_kgph = np.zeros(n)
+    qCond_cover_kW = np.zeros(n)
+    qLat_net_kW = np.zeros(n)
+    cond_surface_name = [""] * n
+
+    Tfilm_ext_K = np.full(n, np.nan, dtype=float)
+    Tfilm_in_K = np.full(n, np.nan, dtype=float)
+    Tsky_K_arr = np.full(n, np.nan, dtype=float)
+    Tscreen_int_K = np.full(n, np.nan, dtype=float)
+    Tcurtain_int_K = np.full(n, np.nan, dtype=float)
+    Tgap_fs_K = np.full(n, np.nan, dtype=float)
+    Tgap_sc_K = np.full(n, np.nan, dtype=float)
+
+    Tleaf_K_arr = np.full(n, np.nan, dtype=float)
+    Tcover_in_K_arr = np.full(n, np.nan, dtype=float)
+
+    Troom[0] = 24 + 273.15
+    RHin[0] = 0.92
+    W_state[0] = ppm_to_humidity_ratio(Troom[0], RHin[0])
+    Cin_ppm[0] = max(float(Cin_int_ppm), 1.0)
+
+    for i in range(n):
+        RHin[i] = humidity_ratio_to_rh(Troom[i], W_state[i])
+
+        LAI_t = float(LAI_series[i])
+        Ld_t = float(Ld_series[i])
+        Lw_t = float(Lw_series[i])
+        is_night = float(rad[i]) <= 100.0
+        curtain_on[i] = 1.0 if (is_night and float(Troom[i]) <= (20.0 + 273.15)) else 0.0
+        rain_control[i] = float(rain_on[i])
+
+        Ur, Uw, transGlass, covers = calculate_covering_properties(screen_on[i], curtain_on[i])
+        Ur_values[i] = Ur
+        Uw_values[i] = Uw
+        transGlass_values[i] = transGlass
+        covers_str[i] = ",".join(covers)
+
+        ach_calc, curr_u = determine_ach_and_internal_wind(
+            T_air_K=Troom[i],
+            RH_in_frac=RHin[i],
+            T_out_K=Tout[i],
+            RH_out_frac=RHout[i],
+            wind_speed_out=u_out[i],
+        )
+        ach_calc = float(ach_calc)
+        curr_u = float(curr_u)
+
+        # ACH / internal wind application logic:
+        # 1) At night (rad <= 10), ACH = ACH_night and the internal air velocity is set to 0.05 m/s
+        # 2) Otherwise, during rain protection, ACH = ACH_night
+        # 3) During daytime, the originally calculated ACH and internal air velocity equation are used as is
+        is_night = bool(rad[i] <= 100.0)
+        if is_night:
+            curr_ach = float(ACH_night)
+            curr_u = 0.05
+        elif float(rain_on[i]) >= 0.5:
+            curr_ach = float(ACH_night)
+            curr_u = compute_internal_wind_from_ach(curr_ach)
+        else:
+            curr_ach = float(ach_calc)
+            curr_u = compute_internal_wind_from_ach(curr_ach)
+
+        curr_u = float(np.clip(curr_u, u_int_min, u_int_max))
+        curr_ach = float(max(curr_ach, ACH_night))
+
+        ach[i] = curr_ach
+        u_int[i] = curr_u
+
+        rho, cp, *_ = air_properties(Troom[i])
+        mHouse_i = volumeHouse * rho
+        cAir_kJkgK_i = cp / 1000.0
+
+        rhoAir_kgm3[i] = rho
+        cAir_kJkgK[i] = cAir_kJkgK_i
+        mHouse_kg[i] = mHouse_i
+
+        Tsolair = Tout[i] + (agh * rad[i]) / 17.0
+
+        qRad = (transGlass * areaHouse * rad[i]) / 1000.0
+        qRoof = (Tsolair - Troom[i]) * Ur * areaHouse / 1000.0
+        qFloor = (Tgroundi - Troom[i]) * Ug * areaHouse / 1000.0
+        qSide = (Tsolair - Troom[i]) * Uw * surfaceHouse / 1000.0
+        qVent = curr_ach * (Tout[i] - Troom[i]) * mHouse_i * cAir_kJkgK_i / 3600.0
+
+        qRad_kW[i] = qRad
+        qRoof_kW[i] = qRoof
+        qFloor_kW[i] = qFloor
+        qSide_kW[i] = qSide
+        qVent_kW[i] = qVent
+
+        (qFIR, Tfilm_ext, Tfilm_in, Tscreen_int, Tcurtain_int, h_cover_in, cover_in_surface_name,
+         h_gap_fs_i, h_gap_sc_i, Tgap_fs_i, Tgap_sc_i) = compute_qFIR_kW_internal_multilayer(
+            Ti_K=Troom[i], Te_K=Tout[i], RH_in_frac=RHin[i], covers=covers,
+            areaHouse_=areaHouse, rad_Wm2=rad[i],
+            u_out=u_out[i], cloud_frac=cloud_frac[i],
+            film_thickness_m=None,
+        )
+        qFIR_kW[i] = qFIR
+
+        Tsky_now = compute_Tsky_Swinbank_cloud_single(
+            float(Troom[i]),
+            float(np.clip(RHin[i], 0.0, 1.0)),
+            float(Tout[i]),
+            float(cloud_frac[i]),
+        )
+        Tsky_K_arr[i] = Tsky_now
+
+        eps_cover_lw = float(np.clip(LAYER_PROPS["PO필름"]["eps_lw"], 0.0, 0.9999))
+        qlw_env_total_kW, qlw_env_roof_kW, qlw_env_side_kW = compute_total_envelope_sky_loss_kW(
+            Tfilm_ext_K=Tfilm_ext,
+            Tsky_K=Tsky_now,
+            roof_area_m2=areaHouse,
+            side_area_m2=surfaceHouse,
+            eps_lw_cover=eps_cover_lw,
+            sky_view_roof=sky_view_roof,
+            sky_view_side=sky_view_side,
+        )
+        Qlw_env_total_kW[i] = qlw_env_total_kW
+        Qlw_env_roof_kW[i] = qlw_env_roof_kW
+        Qlw_env_side_kW[i] = qlw_env_side_kW
+        Qlw_env_total_Wm2[i] = qlw_env_total_kW * 1000.0 / max(areaHouse, 1e-9)
+
+        Tfilm_ext_K[i] = Tfilm_ext
+        Tfilm_in_K[i] = Tfilm_in
+        Tscreen_int_K[i] = Tscreen_int
+        Tcurtain_int_K[i] = Tcurtain_int
+        Tgap_fs_K[i] = Tgap_fs_i
+        Tgap_sc_K[i] = Tgap_sc_i
+        h_cover_in_Wm2K[i] = h_cover_in
+        h_gap_fs_Wm2K[i] = h_gap_fs_i
+        h_gap_sc_Wm2K[i] = h_gap_sc_i
+        cond_surface_name[i] = cover_in_surface_name
+
+        deltaT_leaf_air_i = float(deltaT_leaf_air)
+        Tleaf = float(Troom[i] + deltaT_leaf_air_i)
+        Rn, Rns, Rnl_crop, rR_crop = compute_stanghellini_net_radiation(
+            rad[i], transGlass, Troom[i], Tleaf, LAI_val=LAI_t
+        )
+
+        if np.isfinite(Tcurtain_int):
+            Tcover_in = float(Tcurtain_int)
+        elif np.isfinite(Tscreen_int):
+            Tcover_in = float(Tscreen_int)
+        else:
+            Tcover_in = float(Tfilm_in)
+
+        Tleaf_K_arr[i] = Tleaf
+        Tcover_in_K_arr[i] = Tcover_in
+
+        Rn_Wm2[i] = Rn
+        Rnl_crop_Wm2[i] = Rnl_crop
+
+        rad_for_photo = float(rad[i])
+        if rad_for_photo <= 100.0:
+            rad_for_photo = 0.0
+
+        ppfd_above = internal_ppfd_umol(rad_for_photo, transGlass)
+
+        vpd_pa = vpd_leaf_air_Pa(Tleaf, Troom[i], RHin[i])
+        D_kPa = vpd_pa / 1000.0
+        Ca_ppm = float(Cin_ppm[i])
+
+        (
+            A_can_i, A_leaf_i, ppfd_canopy_absorbed, _, A_can_gross_i,
+            R_can_i, J_leaf_i, Vcmax_leaf_i, Cc_i, Cs_i, gsw_i
+        ) = canopy_photosynthesis_textbook(
+            ppfd_above=ppfd_above,
+            LAI_val=LAI_t,
+            Tleaf_K=Tleaf,
+            Ca_ppm=Ca_ppm,
+            VPD_kPa=D_kPa,
+            u_canopy=curr_u,
+            dleaf_m=Ld_t,
+        )
+        ppfd_leaf_eff = (ppfd_canopy_absorbed / max(LAI_t, 1e-9)) if LAI_t > 1e-9 else 0.0
+
+        PPFD_above[i] = ppfd_above
+        PPFD_canopy_absorbed[i] = ppfd_canopy_absorbed
+        PPFD_canopy[i] = ppfd_leaf_eff
+        A_leaf[i] = A_leaf_i
+        A_canopy[i] = A_can_i
+        A_canopy_gross[i] = A_can_gross_i
+        R_canopy[i] = R_can_i
+        J_leaf_series[i] = J_leaf_i
+        Vcmax_leaf_series[i] = Vcmax_leaf_i
+        Cs_ppm[i] = Cs_i
+        Cc_ppm[i] = Cc_i
+        gsw_series[i] = gsw_i
+
+        rs, rc = stomatal_and_canopy_resistance(gsw_i, LAI_val=LAI_t)
+        rc_s_m[i] = rc
+        rs_s_m[i] = rs
+
+        ra_leaf = stanghellini_aerodynamic_resistance(
+            T_air_K=Troom[i], T_leaf_K=Tleaf, u_canopy=curr_u, dleaf_m=Ld_t
+        )
+        rho_leaf, cp_leaf, *_ = air_properties(Troom[i])
+        hs = (rho_leaf * cp_leaf) / max(ra_leaf, 1e-9)
+        hs_Wm2K[i] = hs
+
+        lambdaE, Wtr, h_fg, VPD_pa, ra_leaf = compute_latent_flux_stanghellini_canopy(
+            T_air_K=Troom[i], RH_in_frac=RHin[i], Rn_Wm2=Rn,
+            ra_s_m=ra_leaf, rc_s_m=rc, area_m2=cropArea, LAI_val=LAI_t
+        )
+        Wtr_kgph[i] = Wtr
+        lambdaE_Wm2[i] = lambdaE
+        VPD_Pa[i] = VPD_pa
+        ra_leaf_s_m[i] = ra_leaf
+
+        Win = float(W_state[i])
+
+        Ts_i = float(solution_surface_temp_C) + 273.15
+        RHs = 1.0
+        RHs_solution[i] = RHs
+
+        p_sat_s = saturation_vapor_pressure_Pa(max(Ts_i, 273.15))
+        Wsat_s = 0.622 * p_sat_s / (Patm - p_sat_s)
+        Wsurf = Wsat_s
+
+        hsolution, _, _, _ = h_solution_from_Nu_flatplate(Troom[i], curr_u, L=solution_surface_length)
+        hsolution_Wm2K[i] = hsolution
+        ra_solution = (rho * cp) / max(hsolution, 1e-6)  # s/m
+        ra_solution_s_m[i] = ra_solution
+
+        E_solution = (rho / max(ra_solution, 1e-9)) * (Wsurf - Win)
+        Wev_raw = E_solution * float(cropArea) * float(solution_surface_exposure_fraction) * 3600.0
+        Wev_raw_kgph[i] = Wev_raw
+        Wev = float(max(Wev_raw, 0.0))
+        Wev_kgph[i] = Wev
+
+        Wet_total = float(Wtr + Wev)
+
+        if np.isfinite(Tcurtain_int):
+            Tcond_surface = float(Tcurtain_int)
+        elif np.isfinite(Tscreen_int):
+            Tcond_surface = float(Tscreen_int)
+        else:
+            Tcond_surface = float(Tfilm_in)
+
+        Wcond_cover = compute_cover_condensation_kgph(
+            T_air_K=Troom[i],
+            RH_in_frac=RHin[i],
+            T_cover_in_K=Tcond_surface,
+            h_cond_Wm2K=h_cover_in,
+            area_cond_m2=areaHouse,
+            P=Patm
+        )
+        Wcond_cover_kgph[i] = Wcond_cover
+        qCond_cover = (h_fg * Wcond_cover) / 3600.0 / 1000.0
+        qCond_cover_kW[i] = qCond_cover
+
+        Wout = ppm_to_humidity_ratio(Tout[i], RHout[i])
+
+        rho_dry = (Patm - actual_vapor_pressure_Pa(max(Troom[i], 273.15), RHin[i])) / (R_air * max(Troom[i], 200.0))
+        mHouse_dry = volumeHouse * rho_dry
+        mHouse_dry_kg[i] = mHouse_dry
+
+        Wvt = curr_ach * mHouse_dry * (Win - Wout)
+        Wr = (Wet_total - Wvt - Wcond_cover) / (mHouse_dry + CWhouse)
+
+        qLat = (h_fg * Wet_total) / 3600.0 / 1000.0
+        qLat_kW[i] = qLat
+        qLat_net = (h_fg * max(Wet_total - Wcond_cover, 0.0)) / 3600.0 / 1000.0
+        qLat_net_kW[i] = qLat_net
+
+        Qcrop_kW, _ = compute_Qcrop_sensible_kW(
+            Troom[i], ra_leaf, cropArea, deltaT_leaf_air_i, LAI_val=LAI_t
+        )
+        QcropS_kW[i] = Qcrop_kW
+
+        qt[i] = qRad + qRoof + qFloor + qSide + qVent + Qcrop_kW - qLat_net - qFIR
+
+        Cin_now = float(Cin_ppm[i])
+        dCin_dt_h, co2_info = dCin_dt_ppm_per_h(
+            Cin_ppm=Cin_now,
+            T_in_K=float(Troom[i]),
+            T_out_K=float(Tout[i]),
+            RH_in=float(RHin[i]),
+            RH_out=float(RHout[i]),
+            ach=curr_ach,
+            ppfd_above=ppfd_above,
+            LAI=LAI_t,
+            Tleaf_K=Tleaf,
+            u_canopy=curr_u,
+            dleaf_m=Ld_t,
+            C_out_ppm=float(Cout_ppm),
+        )
+
+        Cbio_ppmph[i] = float(co2_info["F_bio_ppmph"])
+        Cvent_ppmph[i] = float(co2_info["F_vent_ppmph"])
+        Cr_ppmph[i] = float(co2_info["F_bio_ppmph"] + co2_info["F_vent_ppmph"])
+
+        n_dry_air_i = max(float(co2_info.get("c_dry_in_molm3", 0.0)) * float(volumeHouse), 1e-12)
+        coeff_kg_to_ppm_per_h_i = 1e6 / max(n_dry_air_i * m_CO2, 1e-12)
+        Cbio_kgph[i] = Cbio_ppmph[i] / coeff_kg_to_ppm_per_h_i
+        Cvent_kgph[i] = Cvent_ppmph[i] / coeff_kg_to_ppm_per_h_i
+        Cr_kgph[i] = Cr_ppmph[i] / coeff_kg_to_ppm_per_h_i
+
+        if i < n - 1:
+            dt_step_sec = float(dt_sec[i + 1])
+            if (not np.isfinite(dt_step_sec)) or dt_step_sec <= 0:
+                dt_step_sec = 3600.0
+            dt_step_h = dt_step_sec / 3600.0
+
+            sub_dt_sec = 60.0
+            n_sub = max(1, int(np.ceil(dt_step_sec / sub_dt_sec)))
+            sub_dt_h = dt_step_h / n_sub
+
+            Cin_sub = float(Cin_now)
+
+            for _ in range(n_sub):
+                dCin_sub_h, _ = dCin_dt_ppm_per_h(
+                    Cin_ppm=Cin_sub,
+                    T_in_K=float(Troom[i]),
+                    T_out_K=float(Tout[i]),
+                    RH_in=float(RHin[i]),
+                    RH_out=float(RHout[i]),
+                    ach=curr_ach,
+                    ppfd_above=ppfd_above,
+                    LAI=LAI_t,
+                    Tleaf_K=Tleaf,
+                    u_canopy=curr_u,
+                    dleaf_m=Ld_t,
+                    C_out_ppm=float(Cout_ppm),
+                )
+
+                Cin_sub = Cin_sub + dCin_sub_h * sub_dt_h
+                Cin_sub = float(np.clip(Cin_sub, Cin_min_ppm, Cin_max_ppm))
+
+            Cin_ppm[i + 1] = Cin_sub
+
+        if i < n - 1:
+            dt_step_sec = float(dt_sec[i + 1])
+            if (not np.isfinite(dt_step_sec)) or dt_step_sec <= 0:
+                dt_step_sec = 3600.0
+            dt_step_h = dt_step_sec / 3600.0
+
+            cap = mHouse_i * cAir_kJkgK_i + Chouse
+            if cap > 0:
+                Troom[i + 1] = Troom[i] + (qt[i] * dt_step_sec) / cap
+            else:
+                Troom[i + 1] = Troom[i]
+
+            W_state[i + 1] = max(Win + Wr * dt_step_h, 0.0)
+            RHin[i + 1] = humidity_ratio_to_rh(Troom[i + 1], W_state[i + 1])
+
+    out = df.copy()
+    out["Troom_C"] = Troom - 273.15
+    out["RHin_%"] = RHin * 100.0
+    out["Cin_ppm"] = Cin_ppm
+    out["Cs_ppm"] = Cs_ppm  # CO₂ concentration at the leaf surface
+    out["Cc_ppm"] = Cc_ppm  # CO₂ concentration in the chloroplast inside the leaf
+
+    out["ACH"] = ach
+    out["u_int"] = u_int
+    out["active_covers"] = covers_str
+    out["Ur"] = Ur_values
+    out["Uw"] = Uw_values
+    out["transGlass"] = transGlass_values
+
+    out["PPFD_above_umol_m2_s"] = PPFD_above
+    out["PPFD_canopy_umol_m2_s"] = PPFD_canopy
+    out["PPFD_canopy_absorbed_umol_m2_ground_s"] = PPFD_canopy_absorbed
+    out["A_leaf_umol_m2_s"] = A_leaf
+    out["A_canopy_umol_m2_s"] = A_canopy
+    out["A_canopy_gross_umol_m2_s"] = A_canopy_gross
+    out["R_canopy_umol_m2_s"] = R_canopy
+    out["J_leaf_umol_m2_s"] = J_leaf_series
+    out["Vcmax_leaf_umol_m2_s"] = Vcmax_leaf_series
+    out["gsw_mol_m2_s"] = gsw_series
+    out["VPD_Pa"] = VPD_Pa
+    out["Cbio_kg_per_h"] = Cbio_kgph
+    out["Cvent_kg_per_h"] = Cvent_kgph
+    out["Cr_kg_per_h"] = Cr_kgph
+    out["Cbio_ppm_per_h"] = Cbio_ppmph
+    out["Cvent_ppm_per_h"] = Cvent_ppmph
+    out["Cr_ppm_per_h"] = Cr_ppmph
+
+    out["LAI"] = LAI_series
+    out["Ld_m"] = Ld_series
+    out["Lw_m"] = Lw_series
+    out["Ld_cm"] = Ld_series * 100.0
+    out["Lw_cm"] = Lw_series * 100.0
+
+    out["Rn_Wm2"] = Rn_Wm2
+    out["Rnl_crop_Wm2"] = Rnl_crop_Wm2
+    out["lambdaE_Wm2"] = lambdaE_Wm2
+    out["ra_leaf_s_m"] = ra_leaf_s_m
+    out["rs_s_m"] = rs_s_m
+    out["rhoAir_kgm3"] = rhoAir_kgm3
+    out["cAir_kJkgK"] = cAir_kJkgK
+    out["mHouse_kg"] = mHouse_kg
+    out["mHouse_dry_kg"] = mHouse_dry_kg
+    out["areaHouse_m2"] = float(areaHouse)
+    out["cropArea_m2"] = float(cropArea)
+    out["Qlw_env_total_kW"] = Qlw_env_total_kW
+    out["Qlw_env_roof_kW"] = Qlw_env_roof_kW
+    out["Qlw_env_side_kW"] = Qlw_env_side_kW
+    out["Qlw_env_total_Wm2"] = Qlw_env_total_Wm2
+    out["Wtr_kgph"] = Wtr_kgph
+    out["Wev_kgph"] = Wev_kgph
+    out["Wev_raw_kgph"] = Wev_raw_kgph
+    out["RHs_solution"] = RHs_solution
+    out["hsolution_Wm2K"] = hsolution_Wm2K
+    out["ra_solution_s_m"] = ra_solution_s_m
+    out["rc_s_m"] = rc_s_m
+    out["hs_Wm2K"] = hs_Wm2K
+    out["h_cover_in_Wm2K"] = h_cover_in_Wm2K
+    out["h_gap_fs_Wm2K"] = h_gap_fs_Wm2K
+    out["h_gap_sc_Wm2K"] = h_gap_sc_Wm2K
+    out["cond_surface_name"] = cond_surface_name
+    out["Wcond_cover_kgph"] = Wcond_cover_kgph
+    out["qCond_cover_kW"] = qCond_cover_kW
+    out["qLatent_net_kW"] = qLat_net_kW
+
+    out["Tfilm_ext_C"] = Tfilm_ext_K - 273.15
+    out["Tscreen_int_C"] = Tscreen_int_K - 273.15
+    out["Tcurtain_int_C"] = Tcurtain_int_K - 273.15
+    out["Tgap_fs_C"] = Tgap_fs_K - 273.15
+    out["Tgap_sc_C"] = Tgap_sc_K - 273.15
+    out["Tcover_in_C"] = Tcover_in_K_arr - 273.15
+    out["Tleaf_C"] = Tleaf_K_arr - 273.15
+    out["Tsky_C"] = Tsky_K_arr - 273.15
+
+    out["qRad_kW"] = qRad_kW
+    out["qRoof_kW"] = qRoof_kW
+    out["qFloor_kW"] = qFloor_kW
+    out["qSideWall_kW"] = qSide_kW
+    out["qVent_kW"] = qVent_kW
+    out["QcropS_kW"] = QcropS_kW
+    out["qLatent_kW"] = qLat_kW
+    out["qFIR_kW"] = qFIR_kW
+    out["qt_kW"] = qt
+
+    return out
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", default="climate/gimje_greenhouse_lettuce.xlsx", help="입력 엑셀 경로")
+    ap.add_argument("--output", default="", help="출력 엑셀 경로(미지정 시 input 옆에 _knse.xlsx)")
+    args = ap.parse_args()
+
+    in_path = Path(args.input)
+    if not in_path.exists():
+        cand = Path("/mnt/data") / in_path.name
+        if cand.exists():
+            in_path = cand
+        else:
+            cand2 = Path("/mnt/data") / "climate" / in_path.name
+            if cand2.exists():
+                in_path = cand2
+            else:
+                raise FileNotFoundError(f"입력 파일이 없습니다: {in_path}")
+
+    out_path = Path(args.output) if args.output else in_path.with_name(in_path.stem + "_knse.xlsx")
+
+    out_df = run_integrated_TRH_CO2_model(str(in_path))
+    out_df.to_excel(out_path, index=False)
+    print(f"[OK] saved -> {out_path}")
+
+if __name__ == "__main__":
+    main()
